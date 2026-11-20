@@ -24,7 +24,7 @@ jobs:
           pip install requests beautifulsoup4 rich pillow pytest
 
       - name: Run pytest
-        run: pytest -v tests/test_core.py -k "not gui"
+        run: python -m pytest -v tests/test_core.py -k "not gui"
 
   macos-xcode-build:
     name: macOS Wenku8Studio Build & Test

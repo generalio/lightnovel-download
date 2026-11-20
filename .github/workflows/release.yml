@@ -48,17 +48,29 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME:-${{ inputs.tag || 'dev' }}}"
           mkdir -p dist_release/dmg_staging
-          cp -R Wenku8Studio.app dist_release/dmg_staging/
+          ditto Wenku8Studio.app dist_release/dmg_staging/Wenku8Studio.app
           ln -s /Applications dist_release/dmg_staging/Applications
+          touch dist_release/dmg_staging/.metadata_never_index
 
           ZIP_NAME="Wenku8Studio-${VERSION}-macOS-arm64.zip"
           DMG_NAME="Wenku8Studio-${VERSION}-macOS-arm64.dmg"
           PY_NAME="lightnovel-python-${VERSION}.zip"
 
           ditto -c -k --sequesterRsrc --keepParent Wenku8Studio.app "dist_release/${ZIP_NAME}"
-          hdiutil create -volname "Wenku8 Studio ${VERSION}" \
-            -srcfolder dist_release/dmg_staging \
-            -ov -format UDZO "dist_release/${DMG_NAME}"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Creating DMG (attempt $attempt)..."
+            if hdiutil create -volname "Wenku8 Studio ${VERSION}" \
+              -srcfolder dist_release/dmg_staging \
+              -ov -format UDZO "dist_release/${DMG_NAME}"; then
+              break
+            fi
+            if [[ "$attempt" -eq 5 ]]; then
+              echo "hdiutil create failed after 5 attempts"
+              exit 1
+            fi
+            sleep 4
+          done
 
           zip -r "dist_release/${PY_NAME}" \
             Editer.py utils.py lightnovel.py lightnovel_gui.py requirements.txt README.md resource tests
