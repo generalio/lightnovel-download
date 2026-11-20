@@ -54,7 +54,6 @@ jobs:
 
           ZIP_NAME="Wenku8Studio-${VERSION}-macOS-arm64.zip"
           DMG_NAME="Wenku8Studio-${VERSION}-macOS-arm64.dmg"
-          PY_NAME="lightnovel-python-${VERSION}.zip"
 
           ditto -c -k --sequesterRsrc --keepParent Wenku8Studio.app "dist_release/${ZIP_NAME}"
 
@@ -71,9 +70,6 @@ jobs:
             fi
             sleep 4
           done
-
-          zip -r "dist_release/${PY_NAME}" \
-            Editer.py utils.py lightnovel.py lightnovel_gui.py requirements.txt README.md resource tests
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           ls -lh dist_release/

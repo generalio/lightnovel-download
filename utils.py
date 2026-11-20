@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import html
 import io
 import os
@@ -9,6 +10,27 @@ from PIL import Image
 
 _IMG_TAG_RE = re.compile(r'^\[img:(\d+)\]$')
 _BOOK_URL_RE = re.compile(r'(?:/book/|/novel/\d+/)(\d+)')
+_CREDIT_PREFIXES = (
+    '台版 ',
+    '网译版',
+    '轻之国度',
+    '天使动漫',
+    '图源：',
+    '图源:',
+    '扫图：',
+    '扫图:',
+    '录入：',
+    '录入:',
+    '修图：',
+    '修图:',
+    '翻译：',
+    '翻译:',
+    '校对：',
+    '校对:',
+    '润色：',
+    '润色:',
+    '转自 ',
+)
 
 _EXT_MIME_MAP = {
     '.jpg': 'image/jpeg',
@@ -103,17 +125,20 @@ def text2htmls(
     chap_name: str,
     text: str,
     img_files: Optional[Dict[str, str]] = None,
+    clean_credits: bool = False,
 ) -> List[str]:
     """Convert chapter plain text with [img:XX] markers into valid XHTML lines."""
     safe_chap_name = html.escape(chap_name)
     text_body = ['<body>\n', f'<h1>{safe_chap_name}</h1>\n']
 
-    for raw_line in text.splitlines():
+    body_started = False
+    for idx, raw_line in enumerate(text.splitlines()):
         stripped = raw_line.strip()
         if not stripped:
             continue
         img_match = _IMG_TAG_RE.match(stripped)
         if img_match:
+            body_started = True
             img_no = img_match.group(1)
             filename = img_files.get(img_no, f'{img_no}.jpg') if img_files else f'{img_no}.jpg'
             safe_filename = html.escape(filename, quote=True)
@@ -122,6 +147,10 @@ def text2htmls(
                 f'  <div class="illus-box"><img alt="{safe_alt}" src="../Images/{safe_filename}"/></div>\n'
             )
         else:
+            if clean_credits and not body_started and idx < 12:
+                if any(stripped.startswith(p) or '录入组' in stripped for p in _CREDIT_PREFIXES):
+                    continue
+            body_started = True
             text_body.append(f'<p>{html.escape(stripped)}</p>\n')
 
     text_body.append('</body>\n')
@@ -146,10 +175,13 @@ def get_toc_html(
     chap_files: Optional[List[str]] = None,
     book_uuid: Optional[str] = None,
     extra_nav_items: Optional[List[Tuple[str, str]]] = None,
+    volume_groups: Optional[List[Tuple[str, List[Tuple[str, str]]]]] = None,
+    back_nav_items: Optional[List[Tuple[str, str]]] = None,
 ) -> List[str]:
-    """Build EPUB NCX navigation file."""
+    """Build EPUB NCX navigation file (supporting single-level or 2-level merged volume tree)."""
     uid = book_uuid or str(uuid.uuid4())
     safe_title = html.escape(title)
+    depth = 2 if volume_groups else 1
     toc_htmls = [
         '<?xml version="1.0" encoding="utf-8"?>\n',
         '<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN"\n',
@@ -157,7 +189,7 @@ def get_toc_html(
         '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n',
         '  <head>\n',
         f'    <meta name="dtb:uid" content="urn:uuid:{html.escape(uid, quote=True)}" />\n',
-        '    <meta name="dtb:depth" content="1" />\n',
+        f'    <meta name="dtb:depth" content="{depth}" />\n',
         '    <meta name="dtb:totalPageCount" content="0" />\n',
         '    <meta name="dtb:maxPageNumber" content="0" />\n',
         '  </head>\n',
@@ -167,27 +199,84 @@ def get_toc_html(
         '  <navMap>\n',
     ]
 
-    nav_entries: List[Tuple[str, str]] = []
-    if extra_nav_items:
-        nav_entries.extend(extra_nav_items)
-    for chap_no, chap_name in enumerate(chap_names):
-        src = chap_files[chap_no] if chap_files else f'Text/{str(chap_no).zfill(2)}.xhtml'
-        nav_entries.append((chap_name, src))
+    play_order = 0
 
-    for play_order, (label, src) in enumerate(nav_entries, start=1):
-        safe_chap = html.escape(label)
-        safe_src = html.escape(src, quote=True)
+    def _emit_point(label: str, src: str, indent: str, close: bool = True) -> None:
+        nonlocal play_order
+        play_order += 1
         toc_htmls.extend([
-            f'    <navPoint id="navPoint-{play_order}" playOrder="{play_order}">\n',
-            '      <navLabel>\n',
-            f'        <text>{safe_chap}</text>\n',
-            '      </navLabel>\n',
-            f'      <content src="{safe_src}"/>\n',
-            '    </navPoint>\n',
+            f'{indent}<navPoint id="navPoint-{play_order}" playOrder="{play_order}">\n',
+            f'{indent}  <navLabel><text>{html.escape(label)}</text></navLabel>\n',
+            f'{indent}  <content src="{html.escape(src, quote=True)}"/>\n',
         ])
+        if close:
+            toc_htmls.append(f'{indent}</navPoint>\n')
+
+    for label, src in (extra_nav_items or []):
+        _emit_point(label, src, '    ')
+
+    if volume_groups:
+        for vol_title, items in volume_groups:
+            if not items:
+                continue
+            _emit_point(vol_title, items[0][1], '    ', close=False)
+            for label, src in items:
+                _emit_point(label, src, '      ')
+            toc_htmls.append('    </navPoint>\n')
+    else:
+        for chap_no, chap_name in enumerate(chap_names):
+            src = chap_files[chap_no] if chap_files else f'Text/{str(chap_no).zfill(2)}.xhtml'
+            _emit_point(chap_name, src, '    ')
+
+    for label, src in (back_nav_items or []):
+        _emit_point(label, src, '    ')
 
     toc_htmls.extend(['  </navMap>\n', '</ncx>'])
     return toc_htmls
+
+
+def get_nav_xhtml(
+    title: str,
+    chap_names: List[str],
+    chap_files: Optional[List[str]] = None,
+    extra_nav_items: Optional[List[Tuple[str, str]]] = None,
+    volume_groups: Optional[List[Tuple[str, List[Tuple[str, str]]]]] = None,
+    back_nav_items: Optional[List[Tuple[str, str]]] = None,
+) -> List[str]:
+    """Build EPUB 3.0 nav.xhtml navigation document."""
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>\n',
+        '<!DOCTYPE html>\n',
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">\n',
+        '<head>\n',
+        '  <meta charset="utf-8"/>\n',
+        f'  <title>{html.escape(title)}</title>\n',
+        '</head>\n',
+        '<body>\n',
+        '  <nav epub:type="toc" id="toc">\n',
+        '    <h1>目录</h1>\n',
+        '    <ol>\n',
+    ]
+    for label, src in (extra_nav_items or []):
+        lines.append(f'      <li><a href="{html.escape(src, quote=True)}">{html.escape(label)}</a></li>\n')
+    if volume_groups:
+        for vol_title, items in volume_groups:
+            if not items:
+                continue
+            lines.append(f'      <li><a href="{html.escape(items[0][1], quote=True)}">{html.escape(vol_title)}</a>\n')
+            lines.append('        <ol>\n')
+            for label, src in items:
+                lines.append(f'          <li><a href="{html.escape(src, quote=True)}">{html.escape(label)}</a></li>\n')
+            lines.append('        </ol>\n')
+            lines.append('      </li>\n')
+    else:
+        for chap_no, chap_name in enumerate(chap_names):
+            src = chap_files[chap_no] if chap_files else f'Text/{str(chap_no).zfill(2)}.xhtml'
+            lines.append(f'      <li><a href="{html.escape(src, quote=True)}">{html.escape(chap_name)}</a></li>\n')
+    for label, src in (back_nav_items or []):
+        lines.append(f'      <li><a href="{html.escape(src, quote=True)}">{html.escape(label)}</a></li>\n')
+    lines.extend(['    </ol>\n', '  </nav>\n', '</body>\n', '</html>'])
+    return lines
 
 
 def get_style_css(
@@ -323,9 +412,16 @@ def get_content_html(
     series_index: Optional[int] = None,
     has_info_page: bool = False,
     has_style_css: bool = False,
+    epub_version: str = '2',
+    color_files: Optional[List[str]] = None,
+    color_placement: str = 'before',
+    chap_hrefs: Optional[List[str]] = None,
+    include_cover: bool = True,
 ) -> List[str]:
-    """Build EPUB OPF package document with rich bibliographic metadata."""
+    """Build EPUB 2.0 / 3.0 OPF package document with rich bibliographic metadata."""
     uid = book_uuid or str(uuid.uuid4())
+    is_epub3 = str(epub_version) == '3'
+    pkg_version = '3.0' if is_epub3 else '2.0'
     safe_title = html.escape(title)
     safe_author = html.escape(author or '未知')
     safe_cover_id = html.escape(f'x{cover_filename}', quote=True) if cover_filename else ''
@@ -336,15 +432,35 @@ def get_content_html(
         else [f'{str(i).zfill(2)}.jpg' for i in range(num_img)]
     )
 
+    scheme_attr = '' if is_epub3 else ' opf:scheme="UUID"'
     content_htmls = [
         '<?xml version="1.0" encoding="utf-8"?>\n',
-        '<package version="2.0" unique-identifier="BookId" xmlns="http://www.idpf.org/2007/opf">\n',
+        f'<package version="{pkg_version}" unique-identifier="BookId" xmlns="http://www.idpf.org/2007/opf">\n',
         '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">\n',
-        f'    <dc:identifier id="BookId" opf:scheme="UUID">urn:uuid:{html.escape(uid, quote=True)}</dc:identifier>\n',
+        f'    <dc:identifier id="BookId"{scheme_attr}>urn:uuid:{html.escape(uid, quote=True)}</dc:identifier>\n',
         '    <dc:language>zh</dc:language>\n',
         f'    <dc:title>{safe_title}</dc:title>\n',
-        f'    <dc:creator opf:role="aut" opf:file-as="{html.escape(author or "未知", quote=True)}">{safe_author}</dc:creator>\n',
     ]
+
+    if is_epub3:
+        content_htmls.append(f'    <dc:creator id="creator">{safe_author}</dc:creator>\n')
+        content_htmls.append('    <meta refines="#creator" property="role" scheme="marc:relators">aut</meta>\n')
+        modified = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        content_htmls.append(f'    <meta property="dcterms:modified">{modified}</meta>\n')
+        if series_name:
+            content_htmls.append(f'    <meta property="belongs-to-collection" id="series">{html.escape(series_name)}</meta>\n')
+            content_htmls.append('    <meta refines="#series" property="collection-type">series</meta>\n')
+            if series_index is not None:
+                content_htmls.append(f'    <meta refines="#series" property="group-position">{int(series_index)}</meta>\n')
+    else:
+        content_htmls.append(
+            f'    <dc:creator opf:role="aut" opf:file-as="{html.escape(author or "未知", quote=True)}">{safe_author}</dc:creator>\n'
+        )
+        if series_name:
+            content_htmls.append(f'    <meta name="calibre:series" content="{html.escape(series_name, quote=True)}"/>\n')
+        if series_index is not None:
+            content_htmls.append(f'    <meta name="calibre:series_index" content="{int(series_index)}"/>\n')
+
     if publisher:
         content_htmls.append(f'    <dc:publisher>{html.escape(publisher)}</dc:publisher>\n')
     if last_updated:
@@ -354,10 +470,6 @@ def get_content_html(
     for tag in (tags or []):
         if tag:
             content_htmls.append(f'    <dc:subject>{html.escape(tag)}</dc:subject>\n')
-    if series_name:
-        content_htmls.append(f'    <meta name="calibre:series" content="{html.escape(series_name, quote=True)}"/>\n')
-    if series_index is not None:
-        content_htmls.append(f'    <meta name="calibre:series_index" content="{int(series_index)}"/>\n')
     if cover_filename and cover_filename in resolved_imgs:
         content_htmls.append(f'    <meta name="cover" content="{safe_cover_id}"/>\n')
 
@@ -365,51 +477,89 @@ def get_content_html(
         '  </metadata>\n',
         '  <manifest>\n',
         '    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>\n',
-        '    <item id="cover.xhtml" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>\n',
     ])
+    if is_epub3:
+        content_htmls.append('    <item id="nav.xhtml" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>\n')
+    if include_cover:
+        content_htmls.append('    <item id="cover.xhtml" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>\n')
 
     if has_style_css:
         content_htmls.append('    <item id="style.css" href="Styles/style.css" media-type="text/css"/>\n')
     if has_info_page:
         content_htmls.append('    <item id="info.xhtml" href="Text/info.xhtml" media-type="application/xhtml+xml"/>\n')
-    if img_exist:
-        content_htmls.append('    <item id="xcolor" href="Text/color.xhtml" media-type="application/xhtml+xml"/>\n')
 
-    for chap_no in range(num_chap):
-        chap_id = f'x{str(chap_no).zfill(2)}.xhtml'
+    resolved_color_files = list(color_files) if color_files is not None else (['Text/color.xhtml'] if img_exist else [])
+    color_ids: List[str] = []
+    for idx, chref in enumerate(resolved_color_files):
+        cid = 'xcolor' if len(resolved_color_files) == 1 and chref == 'Text/color.xhtml' else f'xcolor_{idx:03d}'
+        color_ids.append(cid)
         content_htmls.append(
-            f'    <item id="{chap_id}" href="Text/{str(chap_no).zfill(2)}.xhtml" media-type="application/xhtml+xml"/>\n'
+            f'    <item id="{cid}" href="{html.escape(chref, quote=True)}" media-type="application/xhtml+xml"/>\n'
+        )
+
+    resolved_chap_hrefs = list(chap_hrefs) if chap_hrefs is not None else [f'Text/{str(i).zfill(2)}.xhtml' for i in range(num_chap)]
+    chap_ids: List[str] = []
+    for chap_no, href in enumerate(resolved_chap_hrefs):
+        chap_id = f'x{str(chap_no).zfill(3)}.xhtml' if len(resolved_chap_hrefs) >= 100 else f'x{str(chap_no).zfill(2)}.xhtml'
+        chap_ids.append(chap_id)
+        content_htmls.append(
+            f'    <item id="{chap_id}" href="{html.escape(href, quote=True)}" media-type="application/xhtml+xml"/>\n'
         )
 
     for img_name in resolved_imgs:
         safe_name = html.escape(img_name, quote=True)
         mime = get_mime_type(img_name)
+        props = ' properties="cover-image"' if (is_epub3 and cover_filename and img_name == cover_filename) else ''
         content_htmls.append(
-            f'    <item id="x{safe_name}" href="Images/{safe_name}" media-type="{mime}"/>\n'
+            f'    <item id="x{safe_name}" href="Images/{safe_name}" media-type="{mime}"{props}/>\n'
         )
 
     content_htmls.extend([
         '  </manifest>\n',
         '  <spine toc="ncx">\n',
-        '    <itemref idref="cover.xhtml"/>\n',
     ])
-
+    if include_cover:
+        content_htmls.append('    <itemref idref="cover.xhtml"/>\n')
     if has_info_page:
         content_htmls.append('    <itemref idref="info.xhtml"/>\n')
-    if img_exist:
-        content_htmls.append('    <itemref idref="xcolor"/>\n')
+    if color_placement != 'after':
+        for cid in color_ids:
+            content_htmls.append(f'    <itemref idref="{cid}"/>\n')
+    for chap_id in chap_ids:
+        content_htmls.append(f'    <itemref idref="{chap_id}"/>\n')
+    if color_placement == 'after':
+        for cid in color_ids:
+            content_htmls.append(f'    <itemref idref="{cid}"/>\n')
 
-    for chap_no in range(num_chap):
-        content_htmls.append(f'    <itemref idref="x{str(chap_no).zfill(2)}.xhtml"/>\n')
-
-    content_htmls.extend([
-        '  </spine>\n',
-        '  <guide>\n',
-        '    <reference type="cover" title="封面" href="Text/cover.xhtml"/>\n',
-        '  </guide>\n',
-        '</package>\n',
-    ])
+    content_htmls.append('  </spine>\n')
+    if include_cover:
+        content_htmls.extend([
+            '  <guide>\n',
+            '    <reference type="cover" title="封面" href="Text/cover.xhtml"/>\n',
+            '  </guide>\n',
+        ])
+    content_htmls.append('</package>\n')
     return content_htmls
+
+
+def render_filename(
+    template: str,
+    title: str,
+    volume: str,
+    index: int,
+    author: str,
+    book_id: str,
+) -> str:
+    """Render sanitized EPUB filename stem from template variables."""
+    tpl = (template or '').strip() or '{title}-{volume}'
+    rendered = (
+        tpl.replace('{title}', title)
+        .replace('{volume}', volume)
+        .replace('{index}', str(index))
+        .replace('{author}', author)
+        .replace('{id}', str(book_id))
+    )
+    return check_chars(rendered)
 
 
 def get_container_html() -> List[str]:

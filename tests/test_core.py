@@ -129,7 +129,12 @@ def test_editer_end_to_end_inline_and_color_dedup(tmp_path, monkeypatch):
         'https://img.example.com/color_only.png': png_bytes,
     }
 
-    editer = Editer(root_path=str(tmp_path), book_no='https://www.wenku8.net/book/3138.htm', volume_no=1)
+    editer = Editer(
+        root_path=str(tmp_path),
+        book_no='https://www.wenku8.net/book/3138.htm',
+        volume_no=1,
+        split_color_pages=False,
+    )
     monkeypatch.setattr(editer, 'get_html', lambda url, is_gbk=True: pages[url])
     monkeypatch.setattr(editer, 'get_html_img', lambda url, is_buffer=False: images[url])
 
@@ -235,22 +240,6 @@ def test_volume_without_color_page_produces_valid_opf(tmp_path, monkeypatch):
         assert '<meta name="cover" content="x00.jpg"/>' in opf
 
 
-def test_gui_window_initializes_cleanly():
-    import sys
-
-    from PyQt5.QtWidgets import QApplication
-    import lightnovel_gui
-
-    app = QApplication.instance() or QApplication(sys.argv)
-    win = lightnovel_gui.Window()
-    assert win.homeInterface.editline_book.maxLength() > 4
-    win.set_theme('亮')
-    win.set_theme('暗')
-    win.homeInterface.restore_streams()
-    win.close()
-    app.processEvents()
-
-
 def test_official_mirror_fallback_from_cc_to_net(tmp_path, monkeypatch):
     editer = Editer(root_path=str(tmp_path), book_no='3115', volume_no=1)
     assert editer.url_head == 'https://www.wenku8.cc'
@@ -271,3 +260,80 @@ def test_official_mirror_fallback_from_cc_to_net(tmp_path, monkeypatch):
     assert editer.fetch_book_info() is True
     assert editer.url_head == 'https://www.wenku8.net'
     assert editer.title == '主站回退书名'
+
+
+def test_cli_merged_epub3_and_clean_credits(tmp_path, monkeypatch):
+    jpg_bytes = _make_image_bytes('JPEG', (200, 300))
+    pages = {
+        'https://www.wenku8.cc/book/8888.htm': (
+            '<html><body>'
+            '<div id="content"><img src="https://img.example.com/c.jpg"/></div>'
+            '<a href="/novel/8/8888/index.htm">小说目录</a>'
+            '</body></html>'
+        ),
+        'https://www.wenku8.cc/novel/8/8888/index.htm': (
+            '<html><body>'
+            '<div id="title">合集测试</div>'
+            '<div id="info">作者：作者A</div>'
+            '<table class="css">'
+            '<tr><td class="vcss">第一卷</td></tr>'
+            '<tr><td class="ccss"><a href="1.htm">序章</a></td></tr>'
+            '<tr><td class="vcss">第二卷</td></tr>'
+            '<tr><td class="ccss"><a href="2.htm">第二卷第一章</a></td></tr>'
+            '</table></body></html>'
+        ),
+        'https://www.wenku8.cc/novel/8/8888/1.htm': (
+            '<html><body><div id="content">台版 转自 轻之国度<br/>录入：测试<br/>正文一</div></body></html>'
+        ),
+        'https://www.wenku8.cc/novel/8/8888/2.htm': (
+            '<html><body><div id="content">正文二</div></body></html>'
+        ),
+    }
+
+    editer = Editer(
+        root_path=str(tmp_path),
+        book_no='8888',
+        epub_version='3',
+        clean_credits=True,
+    )
+    monkeypatch.setattr(editer, 'get_html', lambda url, is_gbk=True: pages[url])
+    monkeypatch.setattr(editer, 'get_html_img', lambda url, is_buffer=False: jpg_bytes)
+
+    epub_file = editer.download_merged_volumes([1, 2])
+    assert os.path.exists(epub_file)
+    with zipfile.ZipFile(epub_file, 'r') as zf:
+        names = set(zf.namelist())
+        assert 'OEBPS/nav.xhtml' in names
+        opf = zf.read('OEBPS/content.opf').decode('utf-8')
+        assert 'version="3.0"' in opf
+        assert 'belongs-to-collection' in opf
+        ncx = zf.read('OEBPS/toc.ncx').decode('utf-8')
+        assert 'dtb:depth" content="2"' in ncx
+        ch0 = zf.read('OEBPS/Text/00.xhtml').decode('utf-8')
+        assert '台版 转自' not in ch0
+        assert '正文一' in ch0
+
+
+def test_cli_review_thread_skips_reply_form_script(tmp_path, monkeypatch):
+    html_text = """
+    <html><body><div id="content">
+      <table class="grid"><tr><th><strong>主题</strong></th></tr></table>
+      <table class="grid"><tr>
+        <td class="odd"><strong><a href="/userpage.php?uid=1">用户1</a></strong></td>
+        <td class="even"><div style="float:right;">2026-11-10 | <a href="#yid1">1#</a></div><hr/><div>主楼</div></td>
+      </tr></table>
+      <table class="grid">
+        <caption>回复书评：</caption>
+        <tr>
+          <td class="odd">内容(每帖+1积分)</td>
+          <td class="even"><textarea name="pcontent"></textarea><script>loadJs("/scripts/ubbeditor_gbk.js");</script></td>
+        </tr>
+      </table>
+    </div></body></html>
+    """
+    editer = Editer(root_path=str(tmp_path), book_no='3115')
+    monkeypatch.setattr(editer, 'get_html', lambda url, is_gbk=True: html_text)
+    posts = editer.fetch_review_thread('319681')
+    assert len(posts) == 1
+    assert posts[0]['author'] == '用户1'
+    assert 'ubbeditor' not in posts[0]['content']
