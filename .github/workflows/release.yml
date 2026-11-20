@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v2.3.0)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-release:
+    name: Build & Package macOS Release
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [[ -n "$LATEST_XCODE" ]]; then
+            sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Run Xcode unit tests
+        working-directory: Wenku8Studio
+        run: |
+          xcodegen generate
+          xcodebuild test \
+            -project Wenku8Studio.xcodeproj \
+            -scheme Wenku8Studio \
+            -destination 'platform=macOS'
+
+      - name: Build Wenku8Studio.app
+        run: ./Wenku8Studio/build_app.sh
+
+      - name: Package .zip and .dmg artifacts
+        id: pkg
+        run: |
+          VERSION="${GITHUB_REF_NAME:-${{ inputs.tag || 'dev' }}}"
+          mkdir -p dist_release/dmg_staging
+          cp -R Wenku8Studio.app dist_release/dmg_staging/
+          ln -s /Applications dist_release/dmg_staging/Applications
+
+          ZIP_NAME="Wenku8Studio-${VERSION}-macOS-arm64.zip"
+          DMG_NAME="Wenku8Studio-${VERSION}-macOS-arm64.dmg"
+          PY_NAME="lightnovel-python-${VERSION}.zip"
+
+          ditto -c -k --sequesterRsrc --keepParent Wenku8Studio.app "dist_release/${ZIP_NAME}"
+          hdiutil create -volname "Wenku8 Studio ${VERSION}" \
+            -srcfolder dist_release/dmg_staging \
+            -ov -format UDZO "dist_release/${DMG_NAME}"
+
+          zip -r "dist_release/${PY_NAME}" \
+            Editer.py utils.py lightnovel.py lightnovel_gui.py requirements.txt README.md resource tests
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          ls -lh dist_release/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.version }}
+          name: "Wenku8 Studio ${{ steps.pkg.outputs.version }}"
+          generate_release_notes: true
+          files: |
+            dist_release/*.dmg
+            dist_release/*.zip

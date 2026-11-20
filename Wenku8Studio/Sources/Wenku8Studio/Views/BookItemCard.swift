@@ -1,0 +1,198 @@
+import SwiftUI
+import Wenku8Core
+
+struct BookCardItem: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let author: String
+    let coverURL: String
+    let publisher: String
+    let status: String
+    let wordCount: String
+    let lastUpdated: String
+    let tags: [String]
+    let summary: String
+
+    init(entry: BookmarkEntry, liveDetail: BookDetail? = nil) {
+        self.id = entry.id
+        self.title = entry.title
+        self.author = entry.author
+        self.coverURL = entry.coverURL
+        self.publisher = entry.publisher
+        self.status = entry.status
+        self.wordCount = entry.wordCount.isEmpty ? (liveDetail?.wordCount ?? "") : entry.wordCount
+        self.lastUpdated = entry.lastUpdated.isEmpty ? (liveDetail?.lastUpdated ?? "") : entry.lastUpdated
+        self.tags = entry.tags.isEmpty ? (liveDetail?.tags ?? []) : entry.tags
+        self.summary = entry.summary.isEmpty ? (liveDetail?.description ?? "") : entry.summary
+    }
+
+    init(authorItem: AuthorBookItem) {
+        self.id = authorItem.id
+        self.title = authorItem.title
+        self.author = authorItem.author
+        self.coverURL = authorItem.coverURL
+        self.publisher = authorItem.category
+        self.status = authorItem.status
+        self.wordCount = authorItem.wordCount
+        self.lastUpdated = authorItem.updatedAt
+        self.tags = authorItem.tags
+        self.summary = authorItem.summary
+    }
+}
+
+struct BookItemCard: View {
+    @EnvironmentObject var vm: StudioViewModel
+
+    let item: BookCardItem
+    var showBookmarkButton: Bool = true
+    var deleteTooltip: String? = nil
+    var onDelete: (() -> Void)? = nil
+    var onToggleBookmark: (() -> Void)? = nil
+
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            coverView
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(item.title)
+                        .font(.headline)
+                        .lineLimit(2)
+
+                    Spacer(minLength: 4)
+
+                    HStack(spacing: 6) {
+                        if showBookmarkButton, let onToggleBookmark {
+                            Button(action: onToggleBookmark) {
+                                Image(systemName: vm.isBookmarked(item.id) ? "bookmark.fill" : "bookmark")
+                                    .font(.caption)
+                                    .foregroundStyle(vm.isBookmarked(item.id) ? Color.accentColor : Color.secondary)
+                            }
+                            .buttonStyle(.glass)
+                            .controlSize(.small)
+                            .help(vm.isBookmarked(item.id) ? "移出书架" : "加入书架")
+                        }
+
+                        if let onDelete {
+                            Button(role: .destructive, action: onDelete) {
+                                Image(systemName: "trash")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.glass)
+                            .controlSize(.small)
+                            .help(deleteTooltip ?? "删除")
+                        }
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    if !item.author.isEmpty {
+                        Button(item.author) {
+                            vm.loadAuthorWorks(author: item.author)
+                        }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                    }
+                    if !item.publisher.isEmpty {
+                        pill(item.publisher, color: .blue)
+                    }
+                    if !item.status.isEmpty {
+                        pill(item.status, color: item.status.contains("完结") ? .green : .orange)
+                    }
+                }
+
+                if !item.wordCount.isEmpty || !item.lastUpdated.isEmpty {
+                    HStack(spacing: 10) {
+                        if !item.wordCount.isEmpty {
+                            Label(item.wordCount, systemImage: "character.book.closed")
+                        }
+                        if !item.lastUpdated.isEmpty {
+                            Label("更新 \(item.lastUpdated)", systemImage: "calendar")
+                        }
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+
+                if !item.tags.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(item.tags.prefix(5), id: \.self) { tag in
+                                Text(tag)
+                                    .font(.caption2)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.secondary.opacity(0.12), in: Capsule())
+                            }
+                        }
+                    }
+                }
+
+                if !item.summary.isEmpty {
+                    Text(item.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 2)
+
+                HStack {
+                    Text("#\(item.id)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                }
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(isHovered ? Color.accentColor.opacity(0.45) : Color.clear, lineWidth: 1.5)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 14))
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .onTapGesture {
+            vm.loadBook(inputOverride: item.id)
+        }
+        .onAppear {
+            vm.ensureCoverLoaded(urlString: item.coverURL)
+        }
+    }
+
+    private var coverView: some View {
+        Group {
+            if let img = vm.coverImageCache[item.coverURL] {
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.secondary.opacity(0.15))
+                    Image(systemName: "book.closed.fill")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(width: 84, height: 120)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .shadow(color: .black.opacity(0.14), radius: 4, y: 2)
+    }
+
+    private func pill(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .foregroundStyle(color)
+            .background(color.opacity(0.14), in: Capsule())
+    }
+}

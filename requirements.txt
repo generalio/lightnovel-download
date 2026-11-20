@@ -1,7 +1,7 @@
 # pip install -r requirements.txt -i https://pypi.org/simple/
-requests
-bs4
-rich
-pyqt5
-PyQt-Fluent-Widgets[full]
-selenium
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+rich>=13.0.0
+pillow>=10.0.0
+pyqt5>=5.15.0
+PyQt-Fluent-Widgets[full]>=1.5.0

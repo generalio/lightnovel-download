@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  python-tests:
+    name: Python Core & EPUB Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install core dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 rich pillow pytest
+
+      - name: Run pytest
+        run: pytest -v tests/test_core.py -k "not gui"
+
+  macos-xcode-build:
+    name: macOS Wenku8Studio Build & Test
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [[ -n "$LATEST_XCODE" ]]; then
+            sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project and run unit tests
+        working-directory: Wenku8Studio
+        run: |
+          xcodegen generate
+          xcodebuild test \
+            -project Wenku8Studio.xcodeproj \
+            -scheme Wenku8Studio \
+            -destination 'platform=macOS'
+
+      - name: Build Release App
+        run: ./Wenku8Studio/build_app.sh
