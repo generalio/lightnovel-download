@@ -114,12 +114,14 @@ struct BookCatalogView: View {
                     Button {
                         vm.toggleBookmark(book)
                     } label: {
+                        let saved = vm.isBookmarked(book.bookId)
                         Label(
-                            vm.isBookmarked(book.bookId) ? "已收藏" : "加入书架",
-                            systemImage: vm.isBookmarked(book.bookId) ? "bookmark.fill" : "bookmark"
+                            saved ? "已在书架" : "加入书架",
+                            systemImage: saved ? "bookmark.fill" : "bookmark"
                         )
                     }
                     .buttonStyle(.bordered)
+                    .help(vm.isCloudSessionAvailable ? "加入/移出书架（已登录，将直接同步到云端书架）" : "加入/移出书架（当前未登录，将暂存本地并在登录后同步）")
                 }
 
                 HStack(spacing: 16) {
@@ -161,6 +163,16 @@ struct BookCatalogView: View {
                 GlassEffectContainer(spacing: 8) {
                     HStack(spacing: 8) {
                         Button {
+                            vm.openLastReadOrFirstChapter()
+                        } label: {
+                            Label("开始阅读", systemImage: "book.pages")
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.tint(.accentColor.opacity(0.18)).interactive(), in: .capsule)
+
+                        Button {
                             vm.openReviewsInspectorForCurrentBook()
                         } label: {
                             Label(vm.showReviewsInspector ? "收起/查看书评" : "查看书评", systemImage: "bubble.left.and.bubble.right")
@@ -172,6 +184,18 @@ struct BookCatalogView: View {
                             vm.showReviewsInspector ? .regular.tint(.accentColor.opacity(0.22)).interactive() : .regular.interactive(),
                             in: .capsule
                         )
+
+                        Button {
+                            vm.voteCurrentBook()
+                        } label: {
+                            Label(vm.isVotingBook ? "投票中..." : "推一下", systemImage: "hand.thumbsup")
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .capsule)
+                        .disabled(vm.isVotingBook)
+                        .help("为本书投推荐票（每日可用账号推荐次数）")
 
                         Button {
                             vm.loadAuthorWorks(author: book.author)
@@ -252,7 +276,16 @@ struct BookCatalogView: View {
                 Spacer()
                 GlassEffectContainer(spacing: 8) {
                     HStack(spacing: 8) {
-                        Button("全选") { vm.selectAllChapters() }
+                        Button {
+                            vm.selectAllChapters()
+                        } label: {
+                            Label(
+                                vm.areAllChaptersSelected ? "已全选整本" : "全选整本",
+                                systemImage: vm.areAllChaptersSelected ? "checkmark.circle.fill" : "checklist.checked"
+                            )
+                        }
+                        .foregroundStyle(vm.areAllChaptersSelected ? Color.accentColor : Color.primary)
+                        Button("仅首卷") { vm.selectFirstVolumeOnly() }
                         Button("清空") { vm.clearSelection() }
                         Button("反选") { vm.invertSelection() }
                         Button("仅含插图卷") { vm.selectIllustratedVolumesOnly() }
@@ -350,9 +383,21 @@ struct BookCatalogView: View {
                     .buttonStyle(.glass)
                 } else {
                     Button {
+                        vm.downloadFullBookAsSingleEPUB()
+                    } label: {
+                        Label("整本一键转 EPUB", systemImage: "books.vertical.fill")
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.large)
+                    .disabled(book.volumes.isEmpty)
+                    .help("自动全选所有分卷与章节，并合并导出为单个完整 EPUB")
+
+                    Button {
                         vm.startDownloadSelected()
                     } label: {
-                        Label("下载并拼装 EPUB", systemImage: "arrow.down.doc.fill")
+                        Label("下载选中 EPUB", systemImage: "arrow.down.doc.fill")
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
                     }

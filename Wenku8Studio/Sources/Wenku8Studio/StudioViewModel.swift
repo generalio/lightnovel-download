@@ -1,6 +1,8 @@
 import AppKit
+import AVFoundation
 import Foundation
 import SwiftUI
+import WebKit
 import Wenku8Core
 
 public enum SidebarSection: String, CaseIterable, Identifiable {
@@ -25,15 +27,8 @@ public enum SidebarSection: String, CaseIterable, Identifiable {
     }
 }
 
-public enum ReaderTheme: String, CaseIterable, Identifiable {
-    case paper = "素白"
-    case sepia = "羊皮纸"
-    case green = "护眼绿"
-    case night = "夜间"
-
-    public var id: String { rawValue }
-
-    public var backgroundColor: Color {
+public extension ReaderTheme {
+    var backgroundColor: Color {
         switch self {
         case .paper: return Color(nsColor: .textBackgroundColor)
         case .sepia: return Color(red: 0.96, green: 0.93, blue: 0.85)
@@ -42,7 +37,7 @@ public enum ReaderTheme: String, CaseIterable, Identifiable {
         }
     }
 
-    public var foregroundColor: Color {
+    var foregroundColor: Color {
         switch self {
         case .paper: return Color.primary
         case .sepia: return Color(red: 0.24, green: 0.18, blue: 0.12)
@@ -51,7 +46,7 @@ public enum ReaderTheme: String, CaseIterable, Identifiable {
         }
     }
 
-    public var swatchColor: Color {
+    var swatchColor: Color {
         switch self {
         case .paper: return Color.white
         case .sepia: return Color(red: 0.93, green: 0.86, blue: 0.72)
@@ -59,20 +54,30 @@ public enum ReaderTheme: String, CaseIterable, Identifiable {
         case .night: return Color(red: 0.18, green: 0.20, blue: 0.24)
         }
     }
+
+    var paperBackingColor: Color {
+        switch self {
+        case .paper: return Color(red: 0.97, green: 0.97, blue: 0.96)
+        case .sepia: return Color(red: 0.94, green: 0.90, blue: 0.81)
+        case .green: return Color(red: 0.85, green: 0.91, blue: 0.85)
+        case .night: return Color(red: 0.14, green: 0.15, blue: 0.18)
+        }
+    }
 }
 
-public enum ReaderFontFamily: String, CaseIterable, Identifiable, Codable {
-    case pingfang = "PingFang SC"
-    case kaiti = "Kaiti SC"
-    case songti = "Songti SC"
-
-    public var id: String { rawValue }
-
-    public var displayName: String {
+public extension ReaderFontFamily {
+    func swiftUIFont(customFontName: String = "", size: CGFloat, bold: Bool = false) -> Font {
         switch self {
-        case .pingfang: return "黑体"
-        case .kaiti: return "楷体"
-        case .songti: return "宋体"
+        case .systemDefault:
+            return .system(size: size, weight: bold ? .bold : .regular)
+        default:
+            let nsFont = ReaderPaginator.resolveNSFont(
+                family: self,
+                customFontName: customFontName,
+                size: size,
+                bold: bold
+            )
+            return Font(nsFont)
         }
     }
 }
@@ -88,6 +93,27 @@ private struct PersistedAppState: Codable {
     var outputDirectoryPath: String
     var customCookie: String
     var lastReadChapterByBook: [String: String]?
+    var autoRefreshCookieEnabled: Bool?
+    var cookieRefreshIntervalMinutes: Int?
+    var lastCookieRefreshAt: Date?
+    var knownCloudBookIds: [String]?
+    var pendingCloudDeleteIds: [String]?
+    var lastBookshelfSyncAt: Date?
+    var readerTheme: ReaderTheme?
+    var readerPageMode: ReaderPageMode?
+    var readerScriptMode: ReaderScriptMode?
+    var readerFontFamily: ReaderFontFamily?
+    var readerCustomFontName: String?
+    var readerFontSize: Double?
+    var readerLineSpacing: Double?
+    var readerParagraphSpacing: Double?
+    var readerColumnWidth: Double?
+    var readerEdgePadding: Double?
+    var readerIndentEnabled: Bool?
+    var readerDualPageEnabled: Bool?
+    var readerSpeechRate: Float?
+    var readerBookmarks: [ReaderBookmarkNote]?
+    var lastReadPageRatioByChapter: [String: Double]?
 }
 
 @MainActor
@@ -119,23 +145,45 @@ public final class StudioViewModel: ObservableObject {
     @Published public var previewImages: [String: NSImage] = [:]
     @Published public var isLoadingPreview: Bool = false
     @Published public var readerTheme: ReaderTheme = .sepia
+    @Published public var readerPageMode: ReaderPageMode = .curl
+    @Published public var readerScriptMode: ReaderScriptMode = .original
+    @Published public var readerFontFamily: ReaderFontFamily = .systemDefault
+    @Published public var readerCustomFontName: String = "PingFang SC"
     @Published public var readerFontSize: Double = 17
     @Published public var readerLineSpacing: Double = 9
     @Published public var readerParagraphSpacing: Double = 12
     @Published public var readerColumnWidth: Double = 760
-    @Published public var readerFontFamily: ReaderFontFamily = .pingfang
+    @Published public var readerEdgePadding: Double = 24
     @Published public var readerIndentEnabled: Bool = true
+    @Published public var readerDualPageEnabled: Bool = false
+    @Published public var isFocusReadingMode: Bool = false
+    @Published public var readerStartAtEndOnOpen: Bool = false
+    @Published public var readerSpeechRate: Float = 0.50
+    @Published public var isSpeakingChapter: Bool = false
+    @Published public var readerBookmarks: [ReaderBookmarkNote] = []
     @Published public var lastReadChapterByBook: [String: String] = [:]
+    @Published public var lastReadPageRatioByChapter: [String: Double] = [:]
 
-    // Discovery & Search
+    public let availableSystemFontFamilies: [String] = NSFontManager.shared.availableFontFamilies.sorted()
+    private let speechSynthesizer = AVSpeechSynthesizer()
+    private var speechDelegateProxy: SpeechSynthesizerDelegateProxy?
+
+    // Discovery & Search & Tags
     @Published public var searchQuery: String = ""
     @Published public var searchScope: SearchScope = .articleName
     @Published public var discoveryBooks: [AuthorBookItem] = []
     @Published public var discoveryTitle: String = "发现好书"
     @Published public var activeDiscoverySort: String = ""
+    @Published public var discoveryPage: Int = 1
+    @Published public var discoveryTotalPages: Int = 1
     @Published public var isLoadingDiscovery: Bool = false
     @Published public var discoveryNotice: String?
     @Published public var discoveryRequiresCookie: Bool = false
+    @Published public var tagGroups: [TagGroup] = []
+    @Published public var isLoadingTags: Bool = false
+    @Published public var selectedTag: String?
+    @Published public var tagSortOption: TagSortOption = .hot
+    @Published public var showTagBrowser: Bool = false
     @Published public var coverImageCache: [String: NSImage] = [:]
 
     // Assembly
@@ -148,25 +196,51 @@ public final class StudioViewModel: ObservableObject {
     @Published public var logs: [String] = []
     @Published public var outputs: [OutputArtifact] = []
 
-    // Bookmarks & History
+    // Unified Bookshelf & History
     @Published public var bookmarks: [BookmarkEntry] = []
     @Published public var history: [BookmarkEntry] = []
+    @Published public var cloudBookcaseGroups: [CloudBookcaseGroup] = []
+    @Published public var activeCloudGroupFilter: String = "all"
+    @Published public var cloudCapacityTip: String = ""
+    @Published public var isSyncingBookshelf: Bool = false
+    @Published public var bookshelfSyncNotice: String?
+    @Published public var lastBookshelfSyncAt: Date?
+    @Published public var isVotingBook: Bool = false
+
+    private var knownCloudBookIds: Set<String> = []
+    private var pendingCloudDeleteIds: Set<String> = []
 
     // Settings & Auth
     @Published public var scrollToAssemblyToken: UUID?
     @Published public var baseURL: String = "https://www.wenku8.cc"
     @Published public var customCookie: String = ""
     @Published public var isTestingCookie: Bool = false
+    @Published public var isRefreshingCookie: Bool = false
+    @Published public var autoRefreshCookieEnabled: Bool = true
+    @Published public var cookieRefreshIntervalMinutes: Int = 15
+    @Published public var lastCookieRefreshAt: Date?
+    @Published public var nextCookieRefreshAt: Date?
+    @Published public var lastCookieRefreshStatus: String?
     @Published public var cookieVerifyMessage: String?
     @Published public var cookieVerifyPassed: Bool?
+    @Published public var userProfile: Wenku8UserProfile?
     @Published public var showWebLoginSheet: Bool = false
     @Published public var maxConcurrency: Int = 8
     @Published public var politeDelaySeconds: Double = 0.25
     @Published public var outputDirectoryPath: String
 
+    private enum DiscoverySource {
+        case list(title: String, path: String)
+        case search(query: String, scope: SearchScope)
+        case tag(name: String, sort: TagSortOption)
+    }
+    private var lastDiscoverySource: DiscoverySource?
+
     private let client: Wenku8Client
     private let epubBuilder = EPUBBuilder()
     private var activeDownloadTask: Task<Void, Never>?
+    private var cookieRefreshTask: Task<Void, Never>?
+    private var foregroundObserver: NSObjectProtocol?
     private var inflightCoverURLs = Set<String>()
 
     public init() {
@@ -175,8 +249,23 @@ public final class StudioViewModel: ObservableObject {
         self.outputDirectoryPath = downloads
         self.client = Wenku8Client(baseURL: "https://www.wenku8.cc", cookie: "", timeout: 15, politeDelaySeconds: 0.25)
         loadPersistedState()
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleAppDidBecomeActive()
+            }
+        }
         Task {
             await syncClientSettings()
+            if !customCookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                await refreshCookieKeepAlive(silent: true)
+                if self.cookieVerifyPassed == true {
+                    self.syncBookshelfBidirectionally(silent: true)
+                }
+            }
         }
     }
 
@@ -327,6 +416,17 @@ public final class StudioViewModel: ObservableObject {
         selectedChapterIds = Set(detail.volumes.flatMap(\.chapters).map(\.id))
     }
 
+    public func selectFirstVolumeOnly() {
+        guard let first = bookDetail?.volumes.first else { return }
+        selectedChapterIds = Set(first.chapters.map(\.id))
+    }
+
+    public var areAllChaptersSelected: Bool {
+        guard let detail = bookDetail else { return false }
+        let allIds = detail.volumes.flatMap(\.chapters).map(\.id)
+        return !allIds.isEmpty && allIds.allSatisfy { selectedChapterIds.contains($0) }
+    }
+
     public func clearSelection() {
         selectedChapterIds.removeAll()
     }
@@ -365,11 +465,13 @@ public final class StudioViewModel: ObservableObject {
 
     // MARK: - Built-in Reader
 
-    public func openChapterInReader(_ chapter: ChapterItem) {
+    public func openChapterInReader(_ chapter: ChapterItem, startAtLastPage: Bool = false) {
+        stopSpeech()
         selectedSection = .reader
         isLoadingPreview = true
         previewImages = [:]
         errorBanner = nil
+        readerStartAtEndOnOpen = startAtLastPage
 
         Task { [weak self] in
             guard let self else { return }
@@ -399,6 +501,82 @@ public final class StudioViewModel: ObservableObject {
             }
             self.isLoadingPreview = false
         }
+    }
+
+    public func updateChapterProgressRatio(chapterId: String, ratio: Double) {
+        lastReadPageRatioByChapter[chapterId] = min(1.0, max(0.0, ratio))
+        savePersistedState()
+    }
+
+    public func toggleReaderBookmark(
+        chapter: ChapterItem,
+        pageIndex: Int,
+        progressRatio: Double,
+        excerpt: String
+    ) {
+        let bookId = bookDetail?.bookId ?? "unknown"
+        if let idx = readerBookmarks.firstIndex(where: { $0.chapterId == chapter.id && $0.pageIndex == pageIndex }) {
+            readerBookmarks.remove(at: idx)
+            statusBanner = "已移除页内书签"
+        } else {
+            let note = ReaderBookmarkNote(
+                bookId: bookId,
+                chapterId: chapter.id,
+                chapterTitle: chapter.title,
+                pageIndex: pageIndex,
+                progressRatio: progressRatio,
+                excerpt: excerpt.isEmpty ? chapter.title : excerpt
+            )
+            readerBookmarks.insert(note, at: 0)
+            statusBanner = "已添加书签：\(chapter.title) 第 \(pageIndex + 1) 页"
+        }
+        savePersistedState()
+    }
+
+    public func removeReaderBookmark(id: UUID) {
+        readerBookmarks.removeAll { $0.id == id }
+        savePersistedState()
+    }
+
+    public func isReaderPageBookmarked(chapterId: String, pageIndex: Int) -> Bool {
+        readerBookmarks.contains { $0.chapterId == chapterId && $0.pageIndex == pageIndex }
+    }
+
+    public func readerBookmarksForCurrentBook() -> [ReaderBookmarkNote] {
+        guard let bookId = bookDetail?.bookId else { return readerBookmarks }
+        return readerBookmarks.filter { $0.bookId == bookId }
+    }
+
+    public func toggleSpeechForCurrentChapter() {
+        if isSpeakingChapter {
+            stopSpeech()
+            return
+        }
+        guard let content = previewChapter else { return }
+        let speechText = ReaderPaginator.plainTextForSpeech(content: content, scriptMode: readerScriptMode)
+        guard !speechText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+        let proxy = SpeechSynthesizerDelegateProxy { [weak self] in
+            Task { @MainActor in
+                self?.isSpeakingChapter = false
+            }
+        }
+        speechDelegateProxy = proxy
+        speechSynthesizer.delegate = proxy
+
+        let utterance = AVSpeechUtterance(string: speechText)
+        let preferredLang = (readerScriptMode == .traditional) ? "zh-TW" : "zh-CN"
+        utterance.voice = AVSpeechSynthesisVoice(language: preferredLang) ?? AVSpeechSynthesisVoice(language: "zh-CN")
+        utterance.rate = max(AVSpeechUtteranceMinimumSpeechRate, min(AVSpeechUtteranceMaximumSpeechRate, readerSpeechRate))
+        speechSynthesizer.speak(utterance)
+        isSpeakingChapter = true
+    }
+
+    public func stopSpeech() {
+        if speechSynthesizer.isSpeaking {
+            speechSynthesizer.stopSpeaking(at: .immediate)
+        }
+        isSpeakingChapter = false
     }
 
     public func readerProgressInfo() -> (current: Int, total: Int)? {
@@ -468,32 +646,36 @@ public final class StudioViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Discovery & Search
+    // MARK: - Discovery, Search & Tags
 
     public func loadAuthorWorks(author: String) {
         guard !author.isEmpty else { return }
         searchQuery = author
         searchScope = .author
         selectedSection = .discovery
-        performDiscoverySearch()
+        performDiscoverySearch(page: 1)
     }
 
-    public func performDiscoverySearch() {
+    public func performDiscoverySearch(page: Int = 1) {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
         isLoadingDiscovery = true
         discoveryNotice = nil
         discoveryRequiresCookie = false
         activeDiscoverySort = ""
+        selectedTag = nil
         discoveryTitle = "搜索「\(q)」"
+        lastDiscoverySource = .search(query: q, scope: searchScope)
 
         Task { [weak self] in
             guard let self else { return }
             await syncClientSettings()
             do {
-                let items = try await client.searchBooks(query: q, scope: searchScope, baseURL: baseURL)
-                self.discoveryBooks = items
-                if items.isEmpty {
+                let res = try await client.searchBooksPaged(query: q, scope: searchScope, page: page, baseURL: baseURL)
+                self.discoveryBooks = res.items
+                self.discoveryPage = res.currentPage
+                self.discoveryTotalPages = res.totalPages
+                if res.items.isEmpty {
                     self.discoveryNotice = "未找到与「\(q)」相关的作品。"
                 }
             } catch let Wenku8Error.loginRequired(msg) {
@@ -506,20 +688,24 @@ public final class StudioViewModel: ObservableObject {
         }
     }
 
-    public func loadDiscoveryList(title: String, path: String) {
+    public func loadDiscoveryList(title: String, path: String, page: Int = 1) {
         isLoadingDiscovery = true
         discoveryNotice = nil
         discoveryRequiresCookie = false
         activeDiscoverySort = path
+        selectedTag = nil
         discoveryTitle = title
+        lastDiscoverySource = .list(title: title, path: path)
 
         Task { [weak self] in
             guard let self else { return }
             await syncClientSettings()
             do {
-                let items = try await client.fetchDiscoveryBooks(listPath: path, baseURL: baseURL)
-                self.discoveryBooks = items
-                if items.isEmpty {
+                let res = try await client.fetchDiscoveryBooksPaged(listPath: path, page: page, baseURL: baseURL)
+                self.discoveryBooks = res.items
+                self.discoveryPage = res.currentPage
+                self.discoveryTotalPages = res.totalPages
+                if res.items.isEmpty {
                     self.discoveryNotice = "当前分类暂无更多数据。"
                 }
             } catch let Wenku8Error.loginRequired(msg) {
@@ -532,6 +718,240 @@ public final class StudioViewModel: ObservableObject {
         }
     }
 
+    public func loadTagGroups() {
+        guard !isLoadingTags else { return }
+        isLoadingTags = true
+        Task { [weak self] in
+            guard let self else { return }
+            await syncClientSettings()
+            do {
+                let groups = try await client.fetchTagGroups(baseURL: baseURL)
+                self.tagGroups = groups
+            } catch let Wenku8Error.loginRequired(msg) {
+                self.discoveryNotice = msg
+                self.discoveryRequiresCookie = true
+            } catch {
+                self.discoveryNotice = "加载标签云失败：\(error.localizedDescription)"
+            }
+            self.isLoadingTags = false
+        }
+    }
+
+    public func loadBooksByTag(_ tag: String, sort: TagSortOption? = nil, page: Int = 1) {
+        let activeSort = sort ?? tagSortOption
+        tagSortOption = activeSort
+        selectedTag = tag
+        activeDiscoverySort = ""
+        isLoadingDiscovery = true
+        discoveryNotice = nil
+        discoveryRequiresCookie = false
+        discoveryTitle = "标签「\(tag)」· \(activeSort.displayName)"
+        lastDiscoverySource = .tag(name: tag, sort: activeSort)
+
+        Task { [weak self] in
+            guard let self else { return }
+            await syncClientSettings()
+            do {
+                let res = try await client.fetchBooksByTag(tag: tag, sort: activeSort, page: page, baseURL: baseURL)
+                self.discoveryBooks = res.items
+                self.discoveryPage = res.currentPage
+                self.discoveryTotalPages = res.totalPages
+                if res.items.isEmpty {
+                    self.discoveryNotice = "标签「\(tag)」下暂无符合条件的作品。"
+                }
+            } catch let Wenku8Error.loginRequired(msg) {
+                self.discoveryNotice = msg
+                self.discoveryRequiresCookie = true
+            } catch {
+                self.discoveryNotice = error.localizedDescription
+            }
+            self.isLoadingDiscovery = false
+        }
+    }
+
+    public func loadDiscoveryPage(_ targetPage: Int) {
+        let clamped = max(1, min(discoveryTotalPages, targetPage))
+        guard clamped != discoveryPage, let source = lastDiscoverySource else { return }
+        switch source {
+        case .list(let title, let path):
+            loadDiscoveryList(title: title, path: path, page: clamped)
+        case .search(let query, let scope):
+            searchQuery = query
+            searchScope = scope
+            performDiscoverySearch(page: clamped)
+        case .tag(let name, let sort):
+            loadBooksByTag(name, sort: sort, page: clamped)
+        }
+    }
+
+    // MARK: - Unified Bookshelf (Cloud + Local Bidirectional Sync) & Account Actions
+
+    public var isCloudSessionAvailable: Bool {
+        !customCookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && cookieVerifyPassed != false
+    }
+
+    public func syncBookshelfBidirectionally(silent: Bool = false) {
+        guard !isSyncingBookshelf else { return }
+        guard !customCookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            bookshelfSyncNotice = "未登录账号：当前使用本地书架，登录后将自动与云端双向同步。"
+            return
+        }
+
+        isSyncingBookshelf = true
+        if !silent {
+            bookshelfSyncNotice = nil
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            await syncClientSettings()
+            do {
+                let firstPull = try await client.fetchAllCloudBookcase(baseURL: baseURL)
+                await syncRefreshedCookieFromClient()
+                if !firstPull.groups.isEmpty {
+                    self.cloudBookcaseGroups = firstPull.groups
+                }
+                self.cloudCapacityTip = firstPull.capacityTip
+
+                let initialPlan = BookmarkEntry.reconcileWithCloud(
+                    local: self.bookmarks,
+                    cloud: firstPull.items,
+                    previouslyKnownCloudIds: self.knownCloudBookIds,
+                    pendingCloudDeleteIds: self.pendingCloudDeleteIds
+                )
+
+                // 1. Flush offline local deletions to cloud
+                for recordId in initialPlan.cloudRecordIdsToDelete {
+                    try? await client.removeFromCloudBookcase(recordId: recordId, baseURL: baseURL)
+                }
+                self.pendingCloudDeleteIds.removeAll()
+
+                // 2. Push unsynced local additions up to cloud
+                var pushedCount = 0
+                for bookId in initialPlan.bookIdsToPushToCloud {
+                    if (try? await client.addToCloudBookcase(bookId: bookId, baseURL: baseURL)) != nil {
+                        pushedCount += 1
+                    }
+                }
+
+                // 3. Re-pull if we pushed items up so cloudRecordId/groupId are populated
+                let finalPage: CloudBookcasePage
+                if pushedCount > 0 {
+                    finalPage = (try? await client.fetchAllCloudBookcase(baseURL: baseURL)) ?? firstPull
+                    if !finalPage.groups.isEmpty {
+                        self.cloudBookcaseGroups = finalPage.groups
+                    }
+                    self.cloudCapacityTip = finalPage.capacityTip
+                } else {
+                    finalPage = firstPull
+                }
+
+                let finalPlan = BookmarkEntry.reconcileWithCloud(
+                    local: initialPlan.mergedBookmarks,
+                    cloud: finalPage.items,
+                    previouslyKnownCloudIds: self.knownCloudBookIds.union(initialPlan.bookIdsToPushToCloud),
+                    pendingCloudDeleteIds: self.pendingCloudDeleteIds
+                )
+
+                self.bookmarks = finalPlan.mergedBookmarks
+                self.knownCloudBookIds = finalPlan.knownCloudBookIds
+                self.lastBookshelfSyncAt = Date()
+                self.cookieVerifyPassed = true
+                let syncMsg = "云端与本地书架已双向同步（共 \(self.bookmarks.count) 本）"
+                self.bookshelfSyncNotice = syncMsg
+                if !silent {
+                    self.statusBanner = syncMsg
+                }
+                self.appendLog("书架双向同步完成：共 \(self.bookmarks.count) 本，上传 \(pushedCount) 本，清理远端删除 \(initialPlan.cloudRecordIdsToDelete.count) 本")
+                self.savePersistedState()
+            } catch Wenku8Error.loginRequired {
+                self.cookieVerifyPassed = false
+                self.bookshelfSyncNotice = "登录已过期，当前显示本地缓存书架；重新登录后将自动双向同步。"
+                if !silent {
+                    self.errorBanner = "登录已过期，请重新网页登录后同步云端书架。"
+                }
+            } catch {
+                self.bookshelfSyncNotice = "云端同步失败（暂显示本地书架）：\(error.localizedDescription)"
+                if !silent {
+                    self.errorBanner = error.localizedDescription
+                }
+            }
+            self.isSyncingBookshelf = false
+        }
+    }
+
+    public func moveBookmarkToCloudGroup(_ entry: BookmarkEntry, toClassId: String) {
+        guard !entry.cloudRecordId.isEmpty, entry.cloudGroupId != toClassId else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await syncClientSettings()
+            do {
+                try await client.moveCloudBookcaseItems(
+                    recordIds: [entry.cloudRecordId],
+                    fromClassId: entry.cloudGroupId.isEmpty ? "0" : entry.cloudGroupId,
+                    toClassId: toClassId,
+                    baseURL: baseURL
+                )
+                if let idx = self.bookmarks.firstIndex(where: { $0.id == entry.id }) {
+                    self.bookmarks[idx].cloudGroupId = toClassId
+                    self.savePersistedState()
+                }
+                self.statusBanner = "已将《\(entry.title)》移动到目标书架分组"
+            } catch {
+                self.errorBanner = error.localizedDescription
+            }
+        }
+    }
+
+    public func openBookmarkChapter(_ entry: BookmarkEntry) {
+        guard !entry.cloudChapterId.isEmpty else {
+            loadBook(inputOverride: entry.id)
+            return
+        }
+        bookInput = entry.id
+        errorBanner = nil
+        statusBanner = nil
+        isLoadingBook = true
+        Task { [weak self] in
+            guard let self else { return }
+            await syncClientSettings()
+            do {
+                let detail = try await client.fetchBookDetail(rawInput: entry.id)
+                self.bookDetail = detail
+                self.recordHistory(detail: detail)
+                if let match = detail.volumes.flatMap(\.chapters).first(where: { $0.url.contains("/\(entry.cloudChapterId).htm") }) {
+                    self.openChapterInReader(match)
+                } else {
+                    self.selectedSection = .catalog
+                }
+            } catch {
+                self.errorBanner = error.localizedDescription
+            }
+            self.isLoadingBook = false
+        }
+    }
+
+    public func voteCurrentBook() {
+        guard let detail = bookDetail, !isVotingBook else { return }
+        isVotingBook = true
+        errorBanner = nil
+        statusBanner = nil
+
+        Task { [weak self] in
+            guard let self else { return }
+            await syncClientSettings()
+            do {
+                let msg = try await client.voteBook(bookId: detail.bookId, baseURL: detail.baseURL)
+                await syncRefreshedCookieFromClient()
+                self.statusBanner = "《\(detail.title)》：\(msg)"
+                self.appendLog("推荐投票《\(detail.title)》：\(msg)")
+            } catch {
+                self.errorBanner = error.localizedDescription
+            }
+            self.isVotingBook = false
+        }
+    }
+
     // MARK: - Bookmarks & History
 
     public func isBookmarked(_ bookId: String) -> Bool {
@@ -539,59 +959,124 @@ public final class StudioViewModel: ObservableObject {
     }
 
     public func toggleBookmark(_ detail: BookDetail) {
-        if let idx = bookmarks.firstIndex(where: { $0.id == detail.bookId }) {
-            bookmarks.remove(at: idx)
-        } else {
-            bookmarks.insert(BookmarkEntry(
-                id: detail.bookId,
-                title: detail.title,
-                author: detail.author,
-                coverURL: detail.coverURL,
-                publisher: detail.publisher,
-                status: detail.status,
-                wordCount: detail.wordCount,
-                lastUpdated: detail.lastUpdated,
-                popularity: detail.popularity,
-                tags: detail.tags,
-                summary: detail.description
-            ), at: 0)
-        }
-        savePersistedState()
+        let entry = BookmarkEntry(
+            id: detail.bookId,
+            title: detail.title,
+            author: detail.author,
+            coverURL: detail.coverURL,
+            publisher: detail.publisher,
+            status: detail.status,
+            wordCount: detail.wordCount,
+            lastUpdated: detail.lastUpdated,
+            popularity: detail.popularity,
+            tags: detail.tags,
+            summary: detail.description
+        )
+        toggleBookmarkFromEntry(entry)
     }
 
     public func toggleBookmarkFromAuthorItem(_ item: AuthorBookItem) {
-        if let idx = bookmarks.firstIndex(where: { $0.id == item.id }) {
-            bookmarks.remove(at: idx)
-        } else {
-            bookmarks.insert(BookmarkEntry(
-                id: item.id,
-                title: item.title,
-                author: item.author,
-                coverURL: item.coverURL,
-                publisher: item.category,
-                status: item.status,
-                wordCount: item.wordCount,
-                lastUpdated: item.updatedAt,
-                popularity: item.popularity,
-                tags: item.tags,
-                summary: item.summary
-            ), at: 0)
-        }
-        savePersistedState()
+        let entry = BookmarkEntry(
+            id: item.id,
+            title: item.title,
+            author: item.author,
+            coverURL: item.coverURL,
+            publisher: item.category,
+            status: item.status,
+            wordCount: item.wordCount,
+            lastUpdated: item.updatedAt,
+            popularity: item.popularity,
+            tags: item.tags,
+            summary: item.summary
+        )
+        toggleBookmarkFromEntry(entry)
     }
 
     public func toggleBookmarkFromEntry(_ entry: BookmarkEntry) {
-        if let idx = bookmarks.firstIndex(where: { $0.id == entry.id }) {
-            bookmarks.remove(at: idx)
+        if isBookmarked(entry.id) {
+            removeBookmark(id: entry.id)
         } else {
+            addBookmarkUnified(entry)
+        }
+    }
+
+    private func addBookmarkUnified(_ entry: BookmarkEntry) {
+        pendingCloudDeleteIds.remove(entry.id)
+        if !bookmarks.contains(where: { $0.id == entry.id }) {
             bookmarks.insert(entry, at: 0)
         }
         savePersistedState()
+
+        guard isCloudSessionAvailable else {
+            statusBanner = "未登录账号，已暂存到本地书架（登录后自动同步至云端）"
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            await syncClientSettings()
+            do {
+                let msg = try await client.addToCloudBookcase(bookId: entry.id, baseURL: baseURL)
+                await syncRefreshedCookieFromClient()
+                if let idx = self.bookmarks.firstIndex(where: { $0.id == entry.id }) {
+                    self.bookmarks[idx].hasSyncedToCloud = true
+                }
+                self.knownCloudBookIds.insert(entry.id)
+                self.savePersistedState()
+                self.statusBanner = "《\(entry.title)》：\(msg)"
+                self.syncBookshelfBidirectionally(silent: true)
+            } catch Wenku8Error.loginRequired {
+                self.cookieVerifyPassed = false
+                self.statusBanner = "登录已失效，已暂存本地书架（重新登录后自动推送云端）"
+            } catch {
+                self.bookshelfSyncNotice = "已先存本地，推至云端失败：\(error.localizedDescription)"
+            }
+        }
     }
 
     public func removeBookmark(id: String) {
+        let existing = bookmarks.first(where: { $0.id == id })
         bookmarks.removeAll { $0.id == id }
+
+        let wasSynced = (existing?.hasSyncedToCloud == true) || knownCloudBookIds.contains(id)
+        let recordId = existing?.cloudRecordId ?? ""
+
+        if !isCloudSessionAvailable {
+            if wasSynced {
+                pendingCloudDeleteIds.insert(id)
+            }
+            savePersistedState()
+            return
+        }
+
+        if wasSynced && recordId.isEmpty {
+            pendingCloudDeleteIds.insert(id)
+        }
         savePersistedState()
+
+        if !recordId.isEmpty {
+            Task { [weak self] in
+                guard let self else { return }
+                await syncClientSettings()
+                do {
+                    try await client.removeFromCloudBookcase(recordId: recordId, baseURL: baseURL)
+                    await syncRefreshedCookieFromClient()
+                    self.knownCloudBookIds.remove(id)
+                    self.pendingCloudDeleteIds.remove(id)
+                    self.savePersistedState()
+                } catch Wenku8Error.loginRequired {
+                    self.cookieVerifyPassed = false
+                    self.pendingCloudDeleteIds.insert(id)
+                    self.savePersistedState()
+                } catch {
+                    self.pendingCloudDeleteIds.insert(id)
+                    self.savePersistedState()
+                }
+            }
+        } else if wasSynced {
+            // Pull & delete via sync if recordId wasn't cached yet
+            syncBookshelfBidirectionally(silent: true)
+        }
     }
 
     public func removeHistoryItem(id: String) {
@@ -620,8 +1105,20 @@ public final class StudioViewModel: ObservableObject {
             guard let self else { return }
             await self.syncClientSettings()
             let res = await self.client.verifyCookieLive(cookie: norm, baseURL: self.baseURL)
+            await self.syncRefreshedCookieFromClient()
             self.cookieVerifyPassed = res.isLoggedIn
             self.cookieVerifyMessage = res.message
+            if res.isLoggedIn {
+                self.userProfile = try? await self.client.fetchUserProfile(baseURL: self.baseURL)
+                await self.syncRefreshedCookieFromClient()
+                self.lastCookieRefreshAt = Date()
+                self.lastCookieRefreshStatus = "验证成功并已同步最新会话"
+                self.rescheduleCookieRefresh()
+                self.syncBookshelfBidirectionally(silent: true)
+            } else {
+                self.userProfile = nil
+                self.stopCookieRefreshScheduler()
+            }
             self.isTestingCookie = false
         }
     }
@@ -631,7 +1128,133 @@ public final class StudioViewModel: ObservableObject {
         showWebLoginSheet = false
         discoveryRequiresCookie = false
         discoveryNotice = nil
+        bookshelfSyncNotice = nil
         testCookieValidity()
+    }
+
+    public func clearSavedCookie() {
+        customCookie = ""
+        cookieVerifyMessage = nil
+        cookieVerifyPassed = nil
+        userProfile = nil
+        lastCookieRefreshStatus = nil
+        stopCookieRefreshScheduler()
+        Task { await syncClientSettings() }
+    }
+
+    public func rescheduleCookieRefresh() {
+        cookieRefreshTask?.cancel()
+        cookieRefreshTask = nil
+
+        let trimmed = customCookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard autoRefreshCookieEnabled, !trimmed.isEmpty, cookieVerifyPassed != false else {
+            nextCookieRefreshAt = nil
+            savePersistedState()
+            return
+        }
+
+        let minutes = max(1, min(180, cookieRefreshIntervalMinutes))
+        cookieRefreshIntervalMinutes = minutes
+        let nextDate = Date().addingTimeInterval(TimeInterval(minutes * 60))
+        nextCookieRefreshAt = nextDate
+        savePersistedState()
+
+        cookieRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(minutes) * 60 * 1_000_000_000)
+                } catch {
+                    break
+                }
+                guard let self, !Task.isCancelled else { break }
+                await self.refreshCookieKeepAlive(silent: true)
+            }
+        }
+    }
+
+    public func stopCookieRefreshScheduler() {
+        cookieRefreshTask?.cancel()
+        cookieRefreshTask = nil
+        nextCookieRefreshAt = nil
+        savePersistedState()
+    }
+
+    private func handleAppDidBecomeActive() {
+        guard autoRefreshCookieEnabled,
+              !customCookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              cookieVerifyPassed != false else {
+            return
+        }
+        let minGap = TimeInterval(max(300, (cookieRefreshIntervalMinutes * 60) / 2))
+        if let last = lastCookieRefreshAt, Date().timeIntervalSince(last) < minGap {
+            return
+        }
+        Task { [weak self] in
+            await self?.refreshCookieKeepAlive(silent: true)
+        }
+    }
+
+    public func refreshCookieKeepAlive(silent: Bool = false) async {
+        let trimmed = customCookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isRefreshingCookie else { return }
+        isRefreshingCookie = true
+        defer { isRefreshingCookie = false }
+
+        // Merge any newer wenku8 cookies persisted in WebKit's WKHTTPCookieStore
+        let webCookies = await fetchWenku8CookiesFromWebStore()
+        if !webCookies.isEmpty {
+            let mergedFromWeb = Wenku8Client.mergeCookieHeader(existing: customCookie, setCookies: webCookies)
+            if !mergedFromWeb.isEmpty && mergedFromWeb != customCookie {
+                customCookie = mergedFromWeb
+            }
+        }
+
+        await syncClientSettings()
+        let result = await client.refreshCookieSession(baseURL: baseURL)
+
+        if result.isLoggedIn {
+            if !result.updatedCookie.isEmpty && result.updatedCookie != customCookie {
+                customCookie = result.updatedCookie
+            }
+            if let profile = result.profile {
+                userProfile = profile
+            }
+            cookieVerifyPassed = true
+            lastCookieRefreshAt = Date()
+            lastCookieRefreshStatus = result.message
+            if !silent {
+                cookieVerifyMessage = result.message
+                statusBanner = result.message
+            }
+            appendLog("Cookie 保活刷新：\(result.message)")
+            rescheduleCookieRefresh()
+        } else {
+            cookieVerifyPassed = false
+            lastCookieRefreshStatus = result.message
+            if !silent {
+                cookieVerifyMessage = result.message
+                errorBanner = result.message
+            }
+            appendLog("Cookie 保活检测失败：\(result.message)")
+            stopCookieRefreshScheduler()
+        }
+    }
+
+    private func syncRefreshedCookieFromClient() async {
+        let latest = await client.currentCookieSnapshot()
+        if !latest.isEmpty && latest != customCookie {
+            customCookie = latest
+            savePersistedState()
+        }
+    }
+
+    private func fetchWenku8CookiesFromWebStore() async -> [HTTPCookie] {
+        await withCheckedContinuation { continuation in
+            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+                let relevant = cookies.filter { $0.domain.lowercased().contains("wenku8") }
+                continuation.resume(returning: relevant)
+            }
+        }
     }
 
     private func recordHistory(detail: BookDetail) {
@@ -657,6 +1280,19 @@ public final class StudioViewModel: ObservableObject {
 
     // MARK: - Download & EPUB Assembly
 
+    public func downloadFullBookAsSingleEPUB() {
+        guard let detail = bookDetail else {
+            errorBanner = "请先拉取书籍目录"
+            return
+        }
+        guard !isDownloading else { return }
+        selectAllChapters()
+        let allVolumes = detail.volumes.compactMap { vol in
+            vol.chapters.isEmpty ? nil : (vol, vol.chapters)
+        }
+        startDownload(detail: detail, chosenVolumes: allVolumes, forceMergedSingle: true)
+    }
+
     public func startDownloadSelected() {
         guard let detail = bookDetail else {
             errorBanner = "请先拉取书籍目录"
@@ -673,24 +1309,75 @@ public final class StudioViewModel: ObservableObject {
             return
         }
 
+        startDownload(detail: detail, chosenVolumes: chosenVolumes, forceMergedSingle: false)
+    }
+
+    private func startDownload(
+        detail: BookDetail,
+        chosenVolumes: [(VolumeItem, [ChapterItem])],
+        forceMergedSingle: Bool
+    ) {
         errorBanner = nil
         statusBanner = nil
         isDownloading = true
         progressFraction = 0
-        currentStageText = "准备下载..."
+        currentStageText = forceMergedSingle ? "准备整本打包单本 EPUB..." : "准备下载..."
         selectedSection = .tasks
         savePersistedState()
 
-        let configSnapshot = assemblyConfig
+        var configSnapshot = assemblyConfig
+        if forceMergedSingle {
+            configSnapshot.exportMode = .mergedSingle
+        }
         let outURL = URL(fileURLWithPath: outputDirectoryPath, isDirectory: true)
         let concurrencySnapshot = maxConcurrency
+        let chapterConcurrency = max(1, min(4, concurrencySnapshot))
 
         activeDownloadTask = Task { [weak self] in
             guard let self else { return }
             await syncClientSettings()
             do {
-                let totalChapters = chosenVolumes.reduce(0) { $0 + $1.1.count }
-                var fetchedChaptersCount = 0
+                let flatTargets: [(volIdx: Int, chapIdx: Int, volTitle: String, chapter: ChapterItem)] = chosenVolumes.enumerated().flatMap { vOffset, pair in
+                    pair.1.enumerated().map { cOffset, chap in
+                        (vOffset, cOffset, pair.0.title, chap)
+                    }
+                }
+                let totalChapters = flatTargets.count
+                var fetchedByKey: [String: ChapterContent] = [:]
+                var completedChapters = 0
+
+                try await withThrowingTaskGroup(of: (String, String, String, ChapterContent).self) { group in
+                    var nextIndex = 0
+                    for _ in 0..<min(chapterConcurrency, totalChapters) {
+                        let target = flatTargets[nextIndex]
+                        nextIndex += 1
+                        group.addTask {
+                            try Task.checkCancellation()
+                            let content = try await self.client.fetchChapterContent(chapter: target.chapter, baseURL: detail.baseURL)
+                            return (target.chapter.id, target.volTitle, target.chapter.title, content)
+                        }
+                    }
+
+                    while let (chapId, volTitle, chapTitle, content) = try await group.next() {
+                        try Task.checkCancellation()
+                        fetchedByKey[chapId] = content
+                        completedChapters += 1
+                        currentStageText = "拉取文本 (\(completedChapters)/\(totalChapters))：\(volTitle) · \(chapTitle)"
+                        appendLog("已抓取 (\(completedChapters)/\(totalChapters))：[\(volTitle)] \(chapTitle)")
+                        progressFraction = 0.55 * (Double(completedChapters) / Double(max(1, totalChapters)))
+
+                        if nextIndex < totalChapters {
+                            let nextTarget = flatTargets[nextIndex]
+                            nextIndex += 1
+                            group.addTask {
+                                try Task.checkCancellation()
+                                let content = try await self.client.fetchChapterContent(chapter: nextTarget.chapter, baseURL: detail.baseURL)
+                                return (nextTarget.chapter.id, nextTarget.volTitle, nextTarget.chapter.title, content)
+                            }
+                        }
+                    }
+                }
+
                 var builtVolumes: [VolumeBuildInput] = []
                 var allImageURLs: [String] = []
                 if !detail.coverURL.isEmpty {
@@ -698,25 +1385,18 @@ public final class StudioViewModel: ObservableObject {
                 }
 
                 for (vol, chaps) in chosenVolumes {
-                    try Task.checkCancellation()
                     var bodyContents: [ChapterContent] = []
                     var illusContent: ChapterContent?
-
                     for chap in chaps {
-                        try Task.checkCancellation()
-                        currentStageText = "拉取文本：\(vol.title) · \(chap.title)"
-                        appendLog("正在抓取：[\(vol.title)] \(chap.title)")
-                        let content = try await client.fetchChapterContent(chapter: chap, baseURL: detail.baseURL)
-                        allImageURLs.append(contentsOf: content.imageURLs)
-                        if chap.isIllustrationChapter && illusContent == nil {
-                            illusContent = content
-                        } else {
-                            bodyContents.append(content)
+                        if let content = fetchedByKey[chap.id] {
+                            allImageURLs.append(contentsOf: content.imageURLs)
+                            if chap.isIllustrationChapter && illusContent == nil {
+                                illusContent = content
+                            } else {
+                                bodyContents.append(content)
+                            }
                         }
-                        fetchedChaptersCount += 1
-                        progressFraction = 0.55 * (Double(fetchedChaptersCount) / Double(max(1, totalChapters)))
                     }
-
                     builtVolumes.append(VolumeBuildInput(
                         volume: vol,
                         chapters: bodyContents,
@@ -870,7 +1550,28 @@ public final class StudioViewModel: ObservableObject {
             politeDelaySeconds: politeDelaySeconds,
             outputDirectoryPath: outputDirectoryPath,
             customCookie: customCookie,
-            lastReadChapterByBook: lastReadChapterByBook
+            lastReadChapterByBook: lastReadChapterByBook,
+            autoRefreshCookieEnabled: autoRefreshCookieEnabled,
+            cookieRefreshIntervalMinutes: cookieRefreshIntervalMinutes,
+            lastCookieRefreshAt: lastCookieRefreshAt,
+            knownCloudBookIds: Array(knownCloudBookIds),
+            pendingCloudDeleteIds: Array(pendingCloudDeleteIds),
+            lastBookshelfSyncAt: lastBookshelfSyncAt,
+            readerTheme: readerTheme,
+            readerPageMode: readerPageMode,
+            readerScriptMode: readerScriptMode,
+            readerFontFamily: readerFontFamily,
+            readerCustomFontName: readerCustomFontName,
+            readerFontSize: readerFontSize,
+            readerLineSpacing: readerLineSpacing,
+            readerParagraphSpacing: readerParagraphSpacing,
+            readerColumnWidth: readerColumnWidth,
+            readerEdgePadding: readerEdgePadding,
+            readerIndentEnabled: readerIndentEnabled,
+            readerDualPageEnabled: readerDualPageEnabled,
+            readerSpeechRate: readerSpeechRate,
+            readerBookmarks: readerBookmarks,
+            lastReadPageRatioByChapter: lastReadPageRatioByChapter
         )
         if let data = try? JSONEncoder().encode(state) {
             try? data.write(to: stateFileURL)
@@ -892,5 +1593,42 @@ public final class StudioViewModel: ObservableObject {
         if !state.outputDirectoryPath.isEmpty { outputDirectoryPath = state.outputDirectoryPath }
         customCookie = state.customCookie
         lastReadChapterByBook = state.lastReadChapterByBook ?? [:]
+        autoRefreshCookieEnabled = state.autoRefreshCookieEnabled ?? true
+        cookieRefreshIntervalMinutes = max(1, min(180, state.cookieRefreshIntervalMinutes ?? 15))
+        lastCookieRefreshAt = state.lastCookieRefreshAt
+        knownCloudBookIds = Set(state.knownCloudBookIds ?? [])
+        pendingCloudDeleteIds = Set(state.pendingCloudDeleteIds ?? [])
+        lastBookshelfSyncAt = state.lastBookshelfSyncAt
+        if let t = state.readerTheme { readerTheme = t }
+        if let pm = state.readerPageMode { readerPageMode = pm }
+        if let sm = state.readerScriptMode { readerScriptMode = sm }
+        if let ff = state.readerFontFamily { readerFontFamily = ff }
+        if let cf = state.readerCustomFontName, !cf.isEmpty { readerCustomFontName = cf }
+        if let fs = state.readerFontSize { readerFontSize = fs }
+        if let ls = state.readerLineSpacing { readerLineSpacing = ls }
+        if let ps = state.readerParagraphSpacing { readerParagraphSpacing = ps }
+        if let cw = state.readerColumnWidth { readerColumnWidth = cw }
+        if let ep = state.readerEdgePadding { readerEdgePadding = max(8, min(96, ep)) }
+        if let ie = state.readerIndentEnabled { readerIndentEnabled = ie }
+        if let dp = state.readerDualPageEnabled { readerDualPageEnabled = dp }
+        if let sr = state.readerSpeechRate { readerSpeechRate = sr }
+        if let rbm = state.readerBookmarks { readerBookmarks = rbm }
+        if let ratios = state.lastReadPageRatioByChapter { lastReadPageRatioByChapter = ratios }
+    }
+}
+
+private final class SpeechSynthesizerDelegateProxy: NSObject, AVSpeechSynthesizerDelegate {
+    let onFinish: @Sendable () -> Void
+
+    init(onFinish: @escaping @Sendable () -> Void) {
+        self.onFinish = onFinish
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        onFinish()
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        onFinish()
     }
 }

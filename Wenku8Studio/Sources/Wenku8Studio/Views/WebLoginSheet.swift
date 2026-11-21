@@ -110,7 +110,24 @@ private struct Wenku8WebView: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            parent.currentURLString = webView.url?.absoluteString ?? ""
+            let urlStr = webView.url?.absoluteString ?? ""
+            parent.currentURLString = urlStr
+            if urlStr.contains("login.php") {
+                // Default session persistence to 1 month so PHPSESSID/jieqiUserInfo doesn't expire immediately
+                webView.evaluateJavaScript("""
+                (function() {
+                    var sel = document.querySelector("select[name='usecookie']");
+                    if (sel && sel.value === "0") {
+                        for (var i = 0; i < sel.options.length; i++) {
+                            if (sel.options[i].value === "2592000") {
+                                sel.value = "2592000";
+                                break;
+                            }
+                        }
+                    }
+                })();
+                """)
+            }
         }
     }
 }

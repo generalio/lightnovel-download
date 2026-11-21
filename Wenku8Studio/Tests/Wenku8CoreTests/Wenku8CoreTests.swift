@@ -236,4 +236,244 @@ final class Wenku8CoreTests: XCTestCase {
         XCTAssertTrue(listing.contains("OEBPS/Styles/style.css"))
         XCTAssertTrue(listing.contains("OEBPS/Text/info.xhtml"))
     }
+
+    func testParseCloudBookcaseAndGroups() {
+        let html = """
+        <html><body>
+          <select name="classlist">
+            <option value="0" selected="selected">默认书架</option>
+            <option value="1">追更中</option>
+          </select>
+          <table class="grid">
+            <tr><th>选择</th><th>小说名称</th><th>作者</th><th>最新书签</th></tr>
+            <tr>
+              <td class="odd"><input type="checkbox" name="checkid[]" value="11249875"/></td>
+              <td class="even"><a href="https://www.wenku8.cc/modules/article/readbookcase.php?aid=3115&amp;bid=11249875">关于我帮助迷路小女孩后</a></td>
+              <td class="odd"><a href="/modules/article/authorarticle.php?author=%E7%8C%AB%E7%8E%84">猫玄</a></td>
+              <td class="even"><a href="https://www.wenku8.cc/modules/article/reader.php?aid=3115&amp;cid=145678">第一卷 第三章</a></td>
+            </tr>
+          </table>
+          <div>您的书架可收藏 300 本，已收藏 1 本</div>
+        </body></html>
+        """
+        let page = Wenku8Client.parseCloudBookcasePage(html: html, baseURL: "https://www.wenku8.cc")
+        XCTAssertEqual(page.groups.count, 2)
+        XCTAssertEqual(page.groups[1].id, "1")
+        XCTAssertEqual(page.groups[1].title, "追更中")
+        XCTAssertEqual(page.activeClassId, "0")
+        XCTAssertEqual(page.items.count, 1)
+        XCTAssertEqual(page.items[0].aid, "3115")
+        XCTAssertEqual(page.items[0].bid, "11249875")
+        XCTAssertEqual(page.items[0].title, "关于我帮助迷路小女孩后")
+        XCTAssertEqual(page.items[0].author, "猫玄")
+        XCTAssertEqual(page.items[0].lastReadChapterId, "145678")
+        XCTAssertEqual(page.items[0].lastReadChapterTitle, "第一卷 第三章")
+        XCTAssertTrue(page.capacityTip.contains("300"))
+    }
+
+    func testParseTagGroupsUserProfileAndPageStats() {
+        let tagsHTML = """
+        <html><body>
+          <ul class="ultops">
+            <li>题材Tags：</li>
+            <li><a href="/modules/article/tags.php?t=%E6%A0%A1%E5%9B%AD">校园</a> <a href="/modules/article/tags.php?t=%E6%81%8B%E7%88%B1">恋爱</a></li>
+            <li>风格Tags：</li>
+            <li><a href="/modules/article/tags.php?t=%E6%AC%A2%E4%B9%90%E5%90%91">欢乐向</a></li>
+          </ul>
+          <em id="pagestats">2/19</em>
+        </body></html>
+        """
+        let groups = Wenku8Client.parseTagGroupsPage(html: tagsHTML)
+        XCTAssertEqual(groups.count, 2)
+        XCTAssertEqual(groups[0].title, "题材")
+        XCTAssertEqual(groups[0].tags, ["校园", "恋爱"])
+        XCTAssertEqual(groups[1].title, "风格")
+        XCTAssertEqual(groups[1].tags, ["欢乐向"])
+
+        let stats = Wenku8Client.parsePageStats(html: tagsHTML)
+        XCTAssertEqual(stats.current, 2)
+        XCTAssertEqual(stats.total, 19)
+
+        let profileHTML = """
+        <html><body><table>
+          <tr align="left"><td class="odd">用户ID：</td><td class="even">123456</td></tr>
+          <tr align="left"><td class="odd">用户名：</td><td class="even">tester</td></tr>
+          <tr align="left"><td class="odd">昵称：</td><td class="even">tester(留空则用户名做昵称)</td></tr>
+          <tr align="left"><td class="odd">等级：</td><td class="even">普通会员</td></tr>
+          <tr align="left"><td class="odd">经验值：</td><td class="even">880</td></tr>
+          <tr align="left"><td class="odd">现有积分：</td><td class="even">120</td></tr>
+          <tr align="left"><td class="odd">书架最大收藏量：</td><td class="even">300</td></tr>
+          <tr align="left"><td class="odd">每天允许推荐次数：</td><td class="even">5</td></tr>
+        </table></body></html>
+        """
+        let profile = Wenku8Client.parseUserProfilePage(html: profileHTML)
+        XCTAssertEqual(profile.userId, "123456")
+        XCTAssertEqual(profile.username, "tester")
+        XCTAssertEqual(profile.level, "普通会员")
+        XCTAssertEqual(profile.holdingPoints, "120")
+        XCTAssertEqual(profile.dailyVoteQuota, "5")
+        XCTAssertEqual(profile.bookcaseCapacity, "300")
+    }
+
+    func testMergeCookieHeaderPreservesAndUpdatesTokens() {
+        let existing = "jieqiVisitId=1; PHPSESSID=old_sess; jieqiUserInfo=token_v1"
+        let cookie1 = HTTPCookie(properties: [
+            .domain: ".wenku8.cc",
+            .path: "/",
+            .name: "PHPSESSID",
+            .value: "new_sess_2026"
+        ])!
+        let cookie2 = HTTPCookie(properties: [
+            .domain: ".wenku8.cc",
+            .path: "/",
+            .name: "jieqiVisitInfo",
+            .value: "fresh_visit"
+        ])!
+        let cookieDeleted = HTTPCookie(properties: [
+            .domain: ".wenku8.cc",
+            .path: "/",
+            .name: "jieqiUserInfo",
+            .value: "deleted"
+        ])!
+
+        let merged = Wenku8Client.mergeCookieHeader(existing: existing, setCookies: [cookie1, cookie2, cookieDeleted])
+        XCTAssertTrue(merged.contains("PHPSESSID=new_sess_2026"))
+        XCTAssertFalse(merged.contains("old_sess"))
+        XCTAssertTrue(merged.contains("jieqiUserInfo=token_v1"))
+        XCTAssertTrue(merged.contains("jieqiVisitInfo=fresh_visit"))
+    }
+
+    func testBidirectionalBookshelfReconciliation() {
+        let localOfflineAdd = BookmarkEntry(
+            id: "100",
+            title: "离线新增",
+            author: "作者A",
+            coverURL: "",
+            publisher: "电击文库",
+            status: "连载中",
+            hasSyncedToCloud: false
+        )
+        let localSyncedKept = BookmarkEntry(
+            id: "200",
+            title: "双方都有",
+            author: "作者B",
+            coverURL: "",
+            publisher: "集英社",
+            status: "连载中",
+            tags: ["校园"],
+            summary: "详细简介",
+            hasSyncedToCloud: true
+        )
+        let localDeletedRemotely = BookmarkEntry(
+            id: "300",
+            title: "远端已删",
+            author: "作者C",
+            coverURL: "",
+            publisher: "",
+            status: "",
+            hasSyncedToCloud: true
+        )
+        let localOfflineDeleteCloud = BookmarkEntry(
+            id: "400",
+            title: "离线删除",
+            author: "作者D",
+            coverURL: "",
+            publisher: "",
+            status: "",
+            hasSyncedToCloud: true
+        )
+
+        let cloudItems = [
+            CloudBookcaseItem(aid: "200", bid: "rec_200", groupId: "1", title: "双方都有", author: "作者B", lastReadChapterId: "99", lastReadChapterTitle: "第二章", coverURL: "https://img/200.jpg"),
+            CloudBookcaseItem(aid: "400", bid: "rec_400", groupId: "0", title: "离线删除", author: "作者D", coverURL: "https://img/400.jpg"),
+            CloudBookcaseItem(aid: "500", bid: "rec_500", groupId: "0", title: "云端新增", author: "作者E", lastReadChapterId: "12", lastReadChapterTitle: "序章", coverURL: "https://img/500.jpg"),
+        ]
+
+        let result = BookmarkEntry.reconcileWithCloud(
+            local: [localOfflineAdd, localSyncedKept, localDeletedRemotely, localOfflineDeleteCloud],
+            cloud: cloudItems,
+            previouslyKnownCloudIds: ["200", "300", "400"],
+            pendingCloudDeleteIds: ["400"]
+        )
+
+        XCTAssertEqual(result.bookIdsToPushToCloud, ["100"])
+        XCTAssertEqual(result.cloudRecordIdsToDelete, ["rec_400"])
+
+        let mergedIds = Set(result.mergedBookmarks.map(\.id))
+        XCTAssertEqual(mergedIds, Set(["100", "200", "500"]))
+
+        let kept200 = result.mergedBookmarks.first { $0.id == "200" }!
+        XCTAssertEqual(kept200.publisher, "集英社")
+        XCTAssertEqual(kept200.tags, ["校园"])
+        XCTAssertEqual(kept200.cloudRecordId, "rec_200")
+        XCTAssertEqual(kept200.cloudGroupId, "1")
+        XCTAssertEqual(kept200.cloudChapterTitle, "第二章")
+
+        let pulled500 = result.mergedBookmarks.first { $0.id == "500" }!
+        XCTAssertTrue(pulled500.hasSyncedToCloud)
+        XCTAssertEqual(pulled500.cloudRecordId, "rec_500")
+        XCTAssertEqual(pulled500.cloudChapterId, "12")
+    }
+
+    func testReaderPaginatorSplitsPagesPlacesIllustrationsAndConvertsScript() {
+        let ch = ChapterItem(
+            id: "c_page",
+            title: "关于仿真翻页测试章节",
+            url: "https://www.wenku8.cc/1.htm",
+            volumeIndex: 1,
+            chapterIndex: 0,
+            isIllustrationChapter: false
+        )
+        let para = String(repeating: "轻小说仿真翻页测试段落内容，检查自动分页边界与字符完整性。", count: 14)
+        let content = ChapterContent(
+            chapter: ch,
+            tokens: [
+                .paragraph(para),
+                .image("https://img.example.com/illus.jpg"),
+                .paragraph("插图之后的收尾段落。"),
+            ],
+            imageURLs: ["https://img.example.com/illus.jpg"]
+        )
+
+        let compactConfig = ReaderPaginationConfig(
+            fontFamily: .systemDefault,
+            fontSize: 18,
+            lineSpacing: 8,
+            paragraphSpacing: 12,
+            indentEnabled: true,
+            scriptMode: .original
+        )
+        let pages = ReaderPaginator.paginate(
+            content: content,
+            config: compactConfig,
+            containerSize: CGSize(width: 340, height: 280)
+        )
+
+        XCTAssertGreaterThanOrEqual(pages.count, 3)
+        let hasIllustrationPage = pages.contains {
+            if case .illustration(let url, _, _) = $0.content {
+                return url == "https://img.example.com/illus.jpg"
+            }
+            return false
+        }
+        XCTAssertTrue(hasIllustrationPage)
+
+        // Traditional conversion & search
+        let tradConfig = ReaderPaginationConfig(
+            fontFamily: .systemDefault,
+            fontSize: 18,
+            lineSpacing: 8,
+            paragraphSpacing: 12,
+            indentEnabled: true,
+            scriptMode: .traditional
+        )
+        let tradPages = ReaderPaginator.paginate(
+            content: content,
+            config: tradConfig,
+            containerSize: CGSize(width: 340, height: 280)
+        )
+        let hits = ReaderPaginator.search("收尾", in: tradPages)
+        XCTAssertFalse(hits.isEmpty)
+        XCTAssertEqual(ReaderPaginator.convertScript("简体中文", mode: .traditional), "簡體中文")
+    }
 }

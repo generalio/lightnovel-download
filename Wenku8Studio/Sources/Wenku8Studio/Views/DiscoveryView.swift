@@ -8,7 +8,11 @@ struct DiscoveryView: View {
         ("总点击榜", "/modules/article/toplist.php?sort=allvisit", "flame.fill"),
         ("最近更新", "/modules/article/toplist.php?sort=lastupdate", "clock.arrow.circlepath"),
         ("总推荐榜", "/modules/article/toplist.php?sort=allvote", "hand.thumbsup.fill"),
+        ("总收藏榜", "/modules/article/toplist.php?sort=goodnum", "bookmark.fill"),
+        ("周点击榜", "/modules/article/toplist.php?sort=weekvisit", "chart.line.uptrend.xyaxis"),
         ("月点击榜", "/modules/article/toplist.php?sort=monthvisit", "calendar"),
+        ("新书一览", "/modules/article/toplist.php?sort=postdate", "sparkle"),
+        ("字数排行", "/modules/article/toplist.php?sort=size", "text.word.spacing"),
         ("完结专区", "/modules/article/articlelist.php?fullflag=1", "checkmark.seal.fill"),
         ("动画化作品", "/modules/article/toplist.php?sort=anime", "sparkles.tv"),
     ]
@@ -20,6 +24,10 @@ struct DiscoveryView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
+                    if vm.showTagBrowser {
+                        tagBrowserCard
+                    }
+
                     if let notice = vm.discoveryNotice {
                         noticeCard(notice)
                     }
@@ -27,6 +35,9 @@ struct DiscoveryView: View {
                     if !vm.discoveryBooks.isEmpty {
                         sectionHeader(vm.discoveryTitle, count: vm.discoveryBooks.count)
                         discoveryGrid(vm.discoveryBooks)
+                        if vm.discoveryTotalPages > 1 {
+                            paginationBar
+                        }
                     } else if let current = vm.bookDetail, !current.recommendations.isEmpty {
                         sectionHeader("关联推荐 · 来自《\(current.title)》", count: current.recommendations.count)
                         recommendationsGrid(current.recommendations)
@@ -77,6 +88,26 @@ struct DiscoveryView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 GlassEffectContainer(spacing: 8) {
                     HStack(spacing: 8) {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                vm.showTagBrowser.toggle()
+                            }
+                            if vm.showTagBrowser && vm.tagGroups.isEmpty {
+                                vm.loadTagGroups()
+                            }
+                        } label: {
+                            Label("Tags 标签云", systemImage: "tag.fill")
+                                .font(.callout)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(vm.showTagBrowser || vm.selectedTag != nil ? Color.accentColor : Color.primary)
+                        .glassEffect(
+                            (vm.showTagBrowser || vm.selectedTag != nil) ? .regular.tint(.accentColor.opacity(0.22)).interactive() : .regular.interactive(),
+                            in: .capsule
+                        )
+
                         ForEach(quickChannels, id: \.path) { channel in
                             let isActive = vm.activeDiscoverySort == channel.path
                             Button {
@@ -140,8 +171,116 @@ struct DiscoveryView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
                 .background(Color.accentColor.opacity(0.14), in: Capsule())
+            if vm.discoveryTotalPages > 1 {
+                Text("第 \(vm.discoveryPage) / \(vm.discoveryTotalPages) 页")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
         }
+    }
+
+    private var paginationBar: some View {
+        HStack(spacing: 12) {
+            Spacer()
+            Button {
+                vm.loadDiscoveryPage(vm.discoveryPage - 1)
+            } label: {
+                Label("上一页", systemImage: "chevron.left")
+            }
+            .buttonStyle(.glass)
+            .disabled(vm.discoveryPage <= 1 || vm.isLoadingDiscovery)
+
+            Text("第 \(vm.discoveryPage) / \(vm.discoveryTotalPages) 页")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Button {
+                vm.loadDiscoveryPage(vm.discoveryPage + 1)
+            } label: {
+                Label("下一页", systemImage: "chevron.right")
+            }
+            .buttonStyle(.glass)
+            .disabled(vm.discoveryPage >= vm.discoveryTotalPages || vm.isLoadingDiscovery)
+            Spacer()
+        }
+        .padding(.top, 6)
+    }
+
+    private var tagBrowserCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("官方 Tags 云集", systemImage: "tag.circle.fill")
+                    .font(.headline)
+                Spacer()
+                Picker("排序", selection: $vm.tagSortOption) {
+                    ForEach(TagSortOption.allCases) { opt in
+                        Text(opt.displayName).tag(opt)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 320)
+                .onChange(of: vm.tagSortOption) { _, newSort in
+                    if let tag = vm.selectedTag {
+                        vm.loadBooksByTag(tag, sort: newSort, page: 1)
+                    }
+                }
+
+                Button("刷新") {
+                    vm.loadTagGroups()
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+            }
+
+            if vm.isLoadingTags {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在拉取标签云...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if vm.tagGroups.isEmpty {
+                Text("暂无标签数据（需要登录后从 wenku8 拉取 Tags 分类）。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(vm.tagGroups) { group in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(group.title)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    ForEach(group.tags, id: \.self) { tag in
+                                        let active = vm.selectedTag == tag
+                                        Button {
+                                            vm.loadBooksByTag(tag, sort: vm.tagSortOption, page: 1)
+                                        } label: {
+                                            Text(tag)
+                                                .font(.caption)
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 4)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .foregroundStyle(active ? Color.white : Color.primary)
+                                        .background(
+                                            active ? Color.accentColor : Color.secondary.opacity(0.12),
+                                            in: Capsule()
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
     private func discoveryGrid(_ items: [AuthorBookItem]) -> some View {

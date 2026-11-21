@@ -12,18 +12,26 @@ struct BookCardItem: Identifiable, Hashable {
     let lastUpdated: String
     let tags: [String]
     let summary: String
+    let cloudChapterTitle: String
+    let hasSyncedToCloud: Bool
+    let cloudRecordId: String
+    let cloudGroupId: String
 
     init(entry: BookmarkEntry, liveDetail: BookDetail? = nil) {
         self.id = entry.id
         self.title = entry.title
         self.author = entry.author
         self.coverURL = entry.coverURL
-        self.publisher = entry.publisher
-        self.status = entry.status
+        self.publisher = entry.publisher.isEmpty ? (liveDetail?.publisher ?? "") : entry.publisher
+        self.status = entry.status.isEmpty ? (liveDetail?.status ?? "") : entry.status
         self.wordCount = entry.wordCount.isEmpty ? (liveDetail?.wordCount ?? "") : entry.wordCount
         self.lastUpdated = entry.lastUpdated.isEmpty ? (liveDetail?.lastUpdated ?? "") : entry.lastUpdated
         self.tags = entry.tags.isEmpty ? (liveDetail?.tags ?? []) : entry.tags
         self.summary = entry.summary.isEmpty ? (liveDetail?.description ?? "") : entry.summary
+        self.cloudChapterTitle = entry.cloudChapterTitle
+        self.hasSyncedToCloud = entry.hasSyncedToCloud
+        self.cloudRecordId = entry.cloudRecordId
+        self.cloudGroupId = entry.cloudGroupId
     }
 
     init(authorItem: AuthorBookItem) {
@@ -37,6 +45,10 @@ struct BookCardItem: Identifiable, Hashable {
         self.lastUpdated = authorItem.updatedAt
         self.tags = authorItem.tags
         self.summary = authorItem.summary
+        self.cloudChapterTitle = ""
+        self.hasSyncedToCloud = false
+        self.cloudRecordId = ""
+        self.cloudGroupId = "0"
     }
 }
 
@@ -45,9 +57,13 @@ struct BookItemCard: View {
 
     let item: BookCardItem
     var showBookmarkButton: Bool = true
+    var showSyncBadge: Bool = false
     var deleteTooltip: String? = nil
     var onDelete: (() -> Void)? = nil
     var onToggleBookmark: (() -> Void)? = nil
+    var onResumeChapter: (() -> Void)? = nil
+    var cloudGroups: [CloudBookcaseGroup] = []
+    var onMoveCloudGroup: ((String) -> Void)? = nil
 
     @State private var isHovered = false
 
@@ -73,6 +89,23 @@ struct BookItemCard: View {
                             .buttonStyle(.glass)
                             .controlSize(.small)
                             .help(vm.isBookmarked(item.id) ? "移出书架" : "加入书架")
+                        }
+
+                        if cloudGroups.count > 1, !item.cloudRecordId.isEmpty, let onMoveCloudGroup {
+                            Menu {
+                                ForEach(cloudGroups.filter { $0.id != item.cloudGroupId }) { group in
+                                    Button("移至 \(group.title)") {
+                                        onMoveCloudGroup(group.id)
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: "folder")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .frame(width: 24)
+                            .help("移动到其他云端书架分组")
                         }
 
                         if let onDelete {
@@ -138,12 +171,33 @@ struct BookItemCard: View {
                         .lineLimit(2)
                 }
 
+                if !item.cloudChapterTitle.isEmpty, let onResumeChapter {
+                    Button(action: onResumeChapter) {
+                        Label("云端续读：\(item.cloudChapterTitle)", systemImage: "book.pages")
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                }
+
                 Spacer(minLength: 2)
 
-                HStack {
+                HStack(spacing: 8) {
                     Text("#\(item.id)")
                         .font(.caption2.monospaced())
                         .foregroundStyle(.tertiary)
+                    if showSyncBadge {
+                        Label(
+                            item.hasSyncedToCloud ? "云端同步" : "仅本地",
+                            systemImage: item.hasSyncedToCloud ? "icloud.fill" : "internaldrive"
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(item.hasSyncedToCloud ? Color.accentColor : Color.secondary)
+                    }
                     Spacer()
                 }
             }

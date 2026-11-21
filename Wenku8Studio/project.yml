@@ -41,8 +41,8 @@ targets:
         CFBundleName: Wenku8 Studio
         CFBundleIconFile: AppIcon
         CFBundleIconName: AppIcon
-        CFBundleShortVersionString: "2.3.0"
-        CFBundleVersion: "4"
+        CFBundleShortVersionString: "2.5.0"
+        CFBundleVersion: "5"
         LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
         NSHighResolutionCapable: true
         NSAppTransportSecurity:

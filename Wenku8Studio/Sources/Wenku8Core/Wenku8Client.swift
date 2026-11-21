@@ -146,6 +146,14 @@ public actor Wenku8Client {
         public let sampleCount: Int
     }
 
+    private static func isLoginPageHTML(_ html: String) -> Bool {
+        if html.contains("本站正式关闭") {
+            return true
+        }
+        let hasLoginForm = html.contains("name=\"username\"") || html.contains("name='username'") || html.contains("action=\"/login.php\"")
+        return hasLoginForm && !html.contains("退出登录")
+    }
+
     public func verifyCookieLive(cookie: String, baseURL: String? = nil) async -> CookieVerifyResult {
         let diag = Self.diagnoseCookieFormat(cookie)
         if diag.normalizedCookie.isEmpty || diag.isForeignSiteCookie {
@@ -158,13 +166,16 @@ public actor Wenku8Client {
         let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
         do {
             let html = try await fetchHTML(urlString: "\(base)/modules/article/toplist.php?sort=allvisit", referer: base, delay: false)
-            if html.contains("本站正式关闭") || html.contains("用户登录") && !html.contains("退出登录") {
-                return CookieVerifyResult(isLoggedIn: false, message: "Cookie 无效或已过期（站点仍返回未登录页面），请重新登录获取。", sampleCount: 0)
+            if Self.isLoginPageHTML(html) {
+                return CookieVerifyResult(isLoggedIn: false, message: "Cookie 无效或已过期（站点返回登录页），请重新网页登录获取。", sampleCount: 0)
             }
             let items = Self.parseAuthorBooksPage(html: html)
+            if items.isEmpty {
+                return CookieVerifyResult(isLoggedIn: false, message: "未能解析出已登录榜单内容，Cookie 可能已失效或站点结构变更。", sampleCount: 0)
+            }
             return CookieVerifyResult(
                 isLoggedIn: true,
-                message: "Cookie 验证成功！已成功访问会员榜单（解析到 \(items.count) 条榜单书籍）。",
+                message: "Cookie 验证成功！已解锁全站榜单、云端书架与标签浏览（测试解析 \(items.count) 条榜单书籍）。",
                 sampleCount: items.count
             )
         } catch {
@@ -251,6 +262,93 @@ public actor Wenku8Client {
         return req
     }
 
+    public static func mergeCookieHeader(existing: String, setCookies: [HTTPCookie]) -> String {
+        var order: [String] = []
+        var map: [String: String] = [:]
+
+        for part in normalizeCookie(existing).split(separator: ";") {
+            let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let eq = trimmed.firstIndex(of: "=") else { continue }
+            let key = String(trimmed[..<eq]).trimmingCharacters(in: .whitespaces)
+            let val = String(trimmed[trimmed.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            guard !key.isEmpty else { continue }
+            if map[key] == nil {
+                order.append(key)
+            }
+            map[key] = val
+        }
+
+        for cookie in setCookies {
+            let key = cookie.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let val = cookie.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { continue }
+            if val.isEmpty || val == "deleted" || (cookie.expiresDate.map { $0 < Date() } ?? false) {
+                continue
+            }
+            if map[key] == nil {
+                order.append(key)
+            }
+            map[key] = val
+        }
+
+        return order.compactMap { k in
+            guard let v = map[k], !v.isEmpty else { return nil }
+            return "\(k)=\(v)"
+        }.joined(separator: "; ")
+    }
+
+    public func currentCookieSnapshot() -> String {
+        customCookie
+    }
+
+    private func captureSetCookies(from response: URLResponse?, url: URL) {
+        guard let http = response as? HTTPURLResponse else { return }
+        var headers: [String: String] = [:]
+        for (k, v) in http.allHeaderFields {
+            if let ks = k as? String, let vs = v as? String {
+                headers[ks] = vs
+            }
+        }
+        let parsed = HTTPCookie.cookies(withResponseHeaderFields: headers, for: url)
+        guard !parsed.isEmpty else { return }
+        let merged = Self.mergeCookieHeader(existing: customCookie, setCookies: parsed)
+        if !merged.isEmpty {
+            customCookie = merged
+        }
+    }
+
+    private static func isCloudflareResponse(_ response: URLResponse?, body: String) -> Bool {
+        if Self.cloudflareMarkers.contains(where: { body.contains($0) }) {
+            return true
+        }
+        guard let http = response as? HTTPURLResponse else { return false }
+        let server = (http.value(forHTTPHeaderField: "Server") ?? "").lowercased()
+        let mitigated = (http.value(forHTTPHeaderField: "cf-mitigated") ?? "").lowercased()
+        if !mitigated.isEmpty { return true }
+        return http.statusCode == 403 && server.contains("cloudflare")
+    }
+
+    public func refreshCookieSession(baseURL: String? = nil) async -> (isLoggedIn: Bool, updatedCookie: String, profile: Wenku8UserProfile?, message: String) {
+        let diag = Self.diagnoseCookieFormat(customCookie)
+        if diag.normalizedCookie.isEmpty || diag.isForeignSiteCookie {
+            return (false, customCookie, nil, diag.message)
+        }
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        do {
+            // Ping userdetail.php (and home/toplist fallback if needed) to keep PHPSESSID alive and capture Set-Cookie headers
+            let html = try await fetchHTML(urlString: "\(base)/userdetail.php", referer: base, delay: false)
+            if Self.isLoginPageHTML(html) {
+                return (false, customCookie, nil, "登录会话已在服务端过期，请重新「网页登录」获取最新 Cookie。")
+            }
+            let profile = Self.parseUserProfilePage(html: html)
+            let name = profile.nickname.isEmpty ? profile.username : profile.nickname
+            let msg = name.isEmpty ? "会话保活刷新成功" : "会话已续期（\(name)）"
+            return (true, customCookie, profile.username.isEmpty ? nil : profile, msg)
+        } catch {
+            return (false, customCookie, nil, "刷新失败：\(error.localizedDescription)")
+        }
+    }
+
     public func fetchHTML(urlString: String, referer: String? = nil, delay: Bool = true) async throws -> String {
         if delay && politeDelaySeconds > 0 {
             try await Task.sleep(nanoseconds: UInt64(politeDelaySeconds * 1_000_000_000))
@@ -272,9 +370,10 @@ public actor Wenku8Client {
             throw Wenku8Error.networkError("\(urlString): \(error.localizedDescription)")
         }
 
+        captureSetCookies(from: response, url: url)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 200
         let text = Self.decodeGB18030(data)
-        if status == 403 || Self.cloudflareMarkers.contains(where: { text.contains($0) }) {
+        if Self.isCloudflareResponse(response, body: text) {
             throw Wenku8Error.cloudflareBlocked(urlString)
         }
         if status >= 400 {
@@ -373,14 +472,24 @@ public actor Wenku8Client {
     }
 
     public func searchBooks(query: String, scope: SearchScope, baseURL: String? = nil) async throws -> [AuthorBookItem] {
+        try await searchBooksPaged(query: query, scope: scope, page: 1, baseURL: baseURL).items
+    }
+
+    public func searchBooksPaged(
+        query: String,
+        scope: SearchScope,
+        page: Int = 1,
+        baseURL: String? = nil
+    ) async throws -> PagedBookResult {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
+        guard !trimmed.isEmpty else { return PagedBookResult(items: []) }
         let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let targetPage = max(1, page)
 
         switch scope {
         case .bookId:
             let detail = try await fetchBookDetail(rawInput: trimmed)
-            return [AuthorBookItem(
+            let item = AuthorBookItem(
                 id: detail.bookId,
                 title: detail.title,
                 author: detail.author,
@@ -392,25 +501,29 @@ public actor Wenku8Client {
                 tags: detail.tags,
                 summary: detail.description,
                 coverURL: detail.coverURL
-            )]
+            )
+            return PagedBookResult(items: [item], currentPage: 1, totalPages: 1)
         case .author:
-            return try await fetchAuthorBooks(author: trimmed, baseURL: base)
+            let encodedAuthor = Self.encodeGBKQuery(trimmed)
+            let url = "\(base)/modules/article/authorarticle.php?author=\(encodedAuthor)&page=\(targetPage)"
+            let html = try await fetchHTML(urlString: url, referer: base, delay: false)
+            return Self.parsePagedBooksPage(html: html)
         case .articleName:
             let encoded = Self.encodeGBKQuery(trimmed)
-            let url = "\(base)/modules/article/search.php?searchtype=articlename&searchkey=\(encoded)"
+            let url = "\(base)/modules/article/search.php?searchtype=articlename&searchkey=\(encoded)&page=\(targetPage)"
             let html = try await fetchHTML(urlString: url, referer: base, delay: false)
-            if html.trimmingCharacters(in: .whitespacesAndNewlines) == "Welcome" || html.contains("本站正式关闭") {
-                throw Wenku8Error.loginRequired("按书名全站搜索需要 wenku8 登录 Cookie，请先在「设置与拼装」中登录获取或填写 Cookie（按作者名/书号搜索可免登录使用）。")
+            if html.trimmingCharacters(in: .whitespacesAndNewlines) == "Welcome" || Self.isLoginPageHTML(html) {
+                throw Wenku8Error.loginRequired("按书名全站搜索需要 wenku8 登录 Cookie，请先在「设置」中网页登录或填写有效 Cookie（按作者名/书号搜索可免登录使用）。")
             }
-            let list = Self.parseAuthorBooksPage(html: html)
-            if !list.isEmpty {
-                return list
+            let paged = Self.parsePagedBooksPage(html: html)
+            if !paged.items.isEmpty {
+                return paged
             }
             // Single-hit search redirects to /book/{id}.htm
             if let singleBook = try? Self.parseBookPage(html: html, bookURL: url, baseURL: base) {
                 let singleId = Self.extractBookId(from: singleBook.catalogURL)
                 if !singleId.isEmpty {
-                    return [AuthorBookItem(
+                    let singleItem = AuthorBookItem(
                         id: singleId,
                         title: singleBook.title,
                         author: singleBook.author,
@@ -422,21 +535,290 @@ public actor Wenku8Client {
                         tags: singleBook.tags,
                         summary: singleBook.description,
                         coverURL: singleBook.coverURL
-                    )]
+                    )
+                    return PagedBookResult(items: [singleItem], currentPage: 1, totalPages: 1)
                 }
             }
-            return []
+            return PagedBookResult(items: [])
         }
     }
 
     public func fetchDiscoveryBooks(listPath: String, baseURL: String? = nil) async throws -> [AuthorBookItem] {
+        try await fetchDiscoveryBooksPaged(listPath: listPath, page: 1, baseURL: baseURL).items
+    }
+
+    public func fetchDiscoveryBooksPaged(
+        listPath: String,
+        page: Int = 1,
+        baseURL: String? = nil
+    ) async throws -> PagedBookResult {
         let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
-        let url = listPath.hasPrefix("http") ? listPath : "\(base)\(listPath)"
-        let html = try await fetchHTML(urlString: url, referer: base, delay: false)
-        if html.contains("本站正式关闭") {
-            throw Wenku8Error.loginRequired("全站榜单与分类专区需要 wenku8 登录 Cookie，请先前往「设置与拼装」一键网页登录或填写 Cookie。")
+        let targetPage = max(1, page)
+        let rawURL = listPath.hasPrefix("http") ? listPath : "\(base)\(listPath)"
+        let url: String
+        if targetPage > 1 {
+            let sep = rawURL.contains("?") ? "&" : "?"
+            url = "\(rawURL)\(sep)page=\(targetPage)"
+        } else {
+            url = rawURL
         }
-        return Self.parseAuthorBooksPage(html: html)
+        let html = try await fetchHTML(urlString: url, referer: base, delay: false)
+        if Self.isLoginPageHTML(html) {
+            throw Wenku8Error.loginRequired("全站榜单与分类专区需要 wenku8 登录 Cookie，请先前往「设置」一键网页登录或填写有效 Cookie。")
+        }
+        return Self.parsePagedBooksPage(html: html)
+    }
+
+    // MARK: - Tags, Cloud Bookcase, User Profile & Voting
+
+    public func fetchTagGroups(baseURL: String? = nil) async throws -> [TagGroup] {
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let url = "\(base)/modules/article/tags.php"
+        let html = try await fetchHTML(urlString: url, referer: base, delay: false)
+        if Self.isLoginPageHTML(html) {
+            throw Wenku8Error.loginRequired("标签云浏览器需要 wenku8 登录 Cookie，请先在「设置」中登录。")
+        }
+        return Self.parseTagGroupsPage(html: html)
+    }
+
+    public func fetchBooksByTag(
+        tag: String,
+        sort: TagSortOption = .hot,
+        page: Int = 1,
+        baseURL: String? = nil
+    ) async throws -> PagedBookResult {
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let encodedTag = Self.encodeGBKQuery(tag)
+        let targetPage = max(1, page)
+        let url = "\(base)/modules/article/tags.php?t=\(encodedTag)&v=\(sort.rawValue)&page=\(targetPage)"
+        let html = try await fetchHTML(urlString: url, referer: "\(base)/modules/article/tags.php", delay: false)
+        if Self.isLoginPageHTML(html) {
+            throw Wenku8Error.loginRequired("标签作品列表需要 wenku8 登录 Cookie，请先在「设置」中登录。")
+        }
+        return Self.parsePagedBooksPage(html: html)
+    }
+
+    public func fetchUserProfile(baseURL: String? = nil) async throws -> Wenku8UserProfile {
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let url = "\(base)/userdetail.php"
+        let html = try await fetchHTML(urlString: url, referer: base, delay: false)
+        if Self.isLoginPageHTML(html) {
+            throw Wenku8Error.loginRequired("查看个人账号详情需要 wenku8 登录 Cookie。")
+        }
+        return Self.parseUserProfilePage(html: html)
+    }
+
+    public func fetchCloudBookcase(classId: String? = nil, baseURL: String? = nil) async throws -> CloudBookcasePage {
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let activeClass = (classId?.isEmpty == false) ? classId! : "0"
+        let url: String
+        if let cid = classId, !cid.isEmpty, cid != "0" {
+            url = "\(base)/modules/article/bookcase.php?classid=\(cid)"
+        } else {
+            url = "\(base)/modules/article/bookcase.php"
+        }
+        let html = try await fetchHTML(urlString: url, referer: base, delay: false)
+        if Self.isLoginPageHTML(html) {
+            throw Wenku8Error.loginRequired("同步远端云端书架需要 wenku8 登录 Cookie，请先在「设置」网页登录或更新 Cookie。")
+        }
+        return Self.parseCloudBookcasePage(html: html, baseURL: base, requestedClassId: activeClass)
+    }
+
+    public func fetchAllCloudBookcase(baseURL: String? = nil) async throws -> CloudBookcasePage {
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let firstPage = try await fetchCloudBookcase(classId: nil, baseURL: base)
+        var allItems = firstPage.items
+        var seenAids = Set(firstPage.items.map(\.aid))
+
+        for group in firstPage.groups where group.id != firstPage.activeClassId {
+            if let page = try? await fetchCloudBookcase(classId: group.id, baseURL: base) {
+                for item in page.items where seenAids.insert(item.aid).inserted {
+                    allItems.append(item)
+                }
+            }
+        }
+
+        return CloudBookcasePage(
+            groups: firstPage.groups,
+            items: allItems,
+            capacityTip: firstPage.capacityTip,
+            activeClassId: firstPage.activeClassId
+        )
+    }
+
+    public func addToCloudBookcase(bookId: String, baseURL: String? = nil) async throws -> String {
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let urlString = "\(base)/modules/article/addbookcase.php?bid=\(bookId)"
+        let (status, location, html) = try await performRequestNoRedirect(
+            urlString: urlString,
+            method: "GET",
+            formItems: nil,
+            referer: "\(base)/book/\(bookId).htm"
+        )
+        if status == 302 {
+            if location.contains("login.php") {
+                throw Wenku8Error.loginRequired("加入云端书架需要先登录 wenku8 账号。")
+            }
+            return "已加入轻小说文库云端书架"
+        }
+        if Self.isLoginPageHTML(html) {
+            throw Wenku8Error.loginRequired("加入云端书架需要先登录 wenku8 账号。")
+        }
+        if html.contains("已经在您的书架") {
+            return "该作品已在您的云端书架中"
+        }
+        if html.contains("处理成功") || html.contains("加入书架成功") {
+            return "已加入轻小说文库云端书架"
+        }
+        let msg = Self.extractBlockContentText(html: html)
+        if !msg.isEmpty {
+            if msg.contains("成功") || msg.contains("书架") {
+                return msg
+            }
+            throw Wenku8Error.parseError(msg)
+        }
+        return "已请求加入云端书架"
+    }
+
+    public func removeFromCloudBookcase(recordId: String, baseURL: String? = nil) async throws {
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let urlString = "\(base)/modules/article/bookcase.php?delid=\(recordId)"
+        let (status, location, html) = try await performRequestNoRedirect(
+            urlString: urlString,
+            method: "GET",
+            formItems: nil,
+            referer: "\(base)/modules/article/bookcase.php"
+        )
+        if status == 302 {
+            if location.contains("login.php") {
+                throw Wenku8Error.loginRequired("操作云端书架需要先登录 wenku8 账号。")
+            }
+            return
+        }
+        if Self.isLoginPageHTML(html) {
+            throw Wenku8Error.loginRequired("操作云端书架需要先登录 wenku8 账号。")
+        }
+        if status >= 400 {
+            throw Wenku8Error.httpError(status, urlString)
+        }
+    }
+
+    public func moveCloudBookcaseItems(
+        recordIds: [String],
+        fromClassId: String,
+        toClassId: String,
+        baseURL: String? = nil
+    ) async throws {
+        guard !recordIds.isEmpty else { return }
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let urlString = "\(base)/modules/article/bookcase.php"
+        var formItems: [(String, String)] = recordIds.map { ("checkid[]", $0) }
+        formItems.append(("classlist", fromClassId))
+        formItems.append(("checkall", "checkall"))
+        formItems.append(("newclassid", toClassId))
+        formItems.append(("classid", fromClassId))
+
+        let (status, location, html) = try await performRequestNoRedirect(
+            urlString: urlString,
+            method: "POST",
+            formItems: formItems,
+            referer: "\(base)/modules/article/bookcase.php"
+        )
+        if status == 302 {
+            if location.contains("login.php") {
+                throw Wenku8Error.loginRequired("移动云端书架分组需要先登录 wenku8 账号。")
+            }
+            return
+        }
+        if Self.isLoginPageHTML(html) {
+            throw Wenku8Error.loginRequired("移动云端书架分组需要先登录 wenku8 账号。")
+        }
+        if status >= 400 {
+            throw Wenku8Error.httpError(status, urlString)
+        }
+    }
+
+    public func voteBook(bookId: String, baseURL: String? = nil) async throws -> String {
+        let base = Self.normalizeBaseURL(baseURL ?? preferredBaseURL)
+        let urlString = "\(base)/modules/article/uservote.php?id=\(bookId)"
+        let (status, location, html) = try await performRequestNoRedirect(
+            urlString: urlString,
+            method: "GET",
+            formItems: nil,
+            referer: "\(base)/book/\(bookId).htm"
+        )
+        if status == 302 && location.contains("login.php") {
+            throw Wenku8Error.loginRequired("推荐作品需要先登录 wenku8 账号。")
+        }
+        if Self.isLoginPageHTML(html) {
+            throw Wenku8Error.loginRequired("推荐作品需要先登录 wenku8 账号。")
+        }
+        let msg = Self.extractBlockContentText(html: html)
+        if !msg.isEmpty {
+            return msg
+        }
+        return status == 302 ? "已发送推荐投票" : "推荐请求已完成"
+    }
+
+    private func performRequestNoRedirect(
+        urlString: String,
+        method: String,
+        formItems: [(String, String)]?,
+        referer: String
+    ) async throws -> (statusCode: Int, location: String, bodyHTML: String) {
+        guard let url = URL(string: urlString) else {
+            throw Wenku8Error.networkError("非法 URL：\(urlString)")
+        }
+        var req = buildRequest(url: url, referer: referer)
+        req.httpMethod = method
+        if let formItems {
+            let encoded = formItems
+                .map { "\(Self.encodeFormComponent($0.0))=\(Self.encodeFormComponent($0.1))" }
+                .joined(separator: "&")
+            req.httpBody = encoded.data(using: .utf8)
+            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        }
+
+        let delegate = NoRedirectSessionDelegate()
+        let tempConfig = URLSessionConfiguration.ephemeral
+        tempConfig.httpCookieAcceptPolicy = .never
+        tempConfig.httpShouldSetCookies = false
+        tempConfig.timeoutIntervalForRequest = requestTimeout
+        let tempSession = URLSession(configuration: tempConfig, delegate: delegate, delegateQueue: nil)
+        defer { tempSession.invalidateAndCancel() }
+
+        let (data, response) = try await tempSession.data(for: req)
+        captureSetCookies(from: response, url: url)
+        let httpResp = response as? HTTPURLResponse
+        let status = httpResp?.statusCode ?? 200
+        let location = httpResp?.value(forHTTPHeaderField: "Location") ?? ""
+        let text = Self.decodeGB18030(data)
+        if Self.isCloudflareResponse(response, body: text) {
+            throw Wenku8Error.cloudflareBlocked(urlString)
+        }
+        if status >= 400 {
+            throw Wenku8Error.httpError(status, urlString)
+        }
+        return (status, location, text)
+    }
+
+    private static func encodeFormComponent(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._*")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    private static func extractBlockContentText(html: String) -> String {
+        guard let doc = try? XMLDocument(xmlString: html, options: [.documentTidyHTML]),
+              let block = (try? doc.nodes(forXPath: "//div[contains(@class,'blockcontent')]").first) as? XMLElement else {
+            return ""
+        }
+        return (block.stringValue ?? "")
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.contains("返回") && !$0.contains("请点击") }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func downloadSingleImage(urlString: String, referer: String? = nil) async throws -> DownloadedImageAsset {
@@ -961,9 +1343,219 @@ public actor Wenku8Client {
         return posts
     }
 
-    public static func parseAuthorBooksPage(html: String) -> [AuthorBookItem] {
+    public static func parsePagedBooksPage(html: String) -> PagedBookResult {
+        let items = parseAuthorBooksPage(html: html)
+        let (cur, total) = parsePageStats(html: html)
+        return PagedBookResult(items: items, currentPage: cur, totalPages: total)
+    }
+
+    public static func parsePageStats(html: String) -> (current: Int, total: Int) {
         guard let doc = try? XMLDocument(xmlString: html, options: [.documentTidyHTML]),
-              let blocks = try? doc.nodes(forXPath: "//div[@id='content']//div[contains(@style,'width:373px')]") as? [XMLElement] else {
+              let el = (try? doc.nodes(forXPath: "//em[@id='pagestats']").first) as? XMLElement else {
+            return (1, 1)
+        }
+        let text = (el.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = text.split(separator: "/").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let cur = parts.first.flatMap(Int.init) ?? 1
+        let total = (parts.count > 1 ? Int(parts[1]) : nil) ?? max(1, cur)
+        return (max(1, cur), max(1, total))
+    }
+
+    public static func parseTagGroupsPage(html: String) -> [TagGroup] {
+        guard let doc = try? XMLDocument(xmlString: html, options: [.documentTidyHTML]),
+              let lists = try? doc.nodes(forXPath: "//ul[contains(@class,'ultops')]") as? [XMLElement] else {
+            return []
+        }
+
+        var groups: [TagGroup] = []
+        var currentTitle = ""
+        var currentTags: [String] = []
+
+        func flush() {
+            if !currentTitle.isEmpty && !currentTags.isEmpty {
+                groups.append(TagGroup(title: currentTitle, tags: currentTags))
+            }
+            currentTags.removeAll()
+        }
+
+        for ul in lists {
+            guard let items = try? ul.nodes(forXPath: "./li") as? [XMLElement] else { continue }
+            for li in items {
+                let raw = (li.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let links = (try? li.nodes(forXPath: ".//a") as? [XMLElement]) ?? []
+                if links.isEmpty && (raw.hasSuffix("Tags：") || raw.hasSuffix("Tags:")) {
+                    flush()
+                    currentTitle = raw
+                        .replacingOccurrences(of: "Tags：", with: "")
+                        .replacingOccurrences(of: "Tags:", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if currentTitle.isEmpty { currentTitle = "全部标签" }
+                } else {
+                    if currentTitle.isEmpty { currentTitle = "热门标签" }
+                    for a in links {
+                        let tagName = (a.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !tagName.isEmpty && !currentTags.contains(tagName) {
+                            currentTags.append(tagName)
+                        }
+                    }
+                }
+            }
+        }
+        flush()
+        return groups
+    }
+
+    public static func parseUserProfilePage(html: String) -> Wenku8UserProfile {
+        guard let doc = try? XMLDocument(xmlString: html, options: [.documentTidyHTML]),
+              let rows = try? doc.nodes(forXPath: "//tr") as? [XMLElement] else {
+            return Wenku8UserProfile()
+        }
+
+        var userId = ""
+        var username = ""
+        var nickname = ""
+        var level = ""
+        var title = ""
+        var holdingPoints = ""
+        var experienceValue = ""
+        var dailyVoteQuota = ""
+        var bookcaseCapacity = ""
+
+        for row in rows {
+            guard let odd = (try? row.nodes(forXPath: "./td[contains(@class,'odd')]").first) as? XMLElement,
+                  let even = (try? row.nodes(forXPath: "./td[contains(@class,'even')]").first) as? XMLElement else {
+                continue
+            }
+            let key = (odd.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let val = (even.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if key.hasPrefix("用户ID：") { userId = val }
+            else if key.hasPrefix("用户名：") { username = val }
+            else if key.hasPrefix("昵称：") {
+                nickname = val.replacingOccurrences(of: "(留空则用户名做昵称)", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            else if key.hasPrefix("等级：") { level = val }
+            else if key.hasPrefix("头衔：") { title = val }
+            else if key.hasPrefix("经验值：") { experienceValue = val }
+            else if key.hasPrefix("现有积分：") { holdingPoints = val }
+            else if key.hasPrefix("书架最大收藏量：") { bookcaseCapacity = val }
+            else if key.hasPrefix("每天允许推荐次数：") { dailyVoteQuota = val }
+        }
+
+        return Wenku8UserProfile(
+            userId: userId,
+            username: username,
+            nickname: nickname,
+            level: level,
+            title: title,
+            holdingPoints: holdingPoints,
+            experienceValue: experienceValue,
+            dailyVoteQuota: dailyVoteQuota,
+            bookcaseCapacity: bookcaseCapacity
+        )
+    }
+
+    public static func parseCloudBookcasePage(
+        html: String,
+        baseURL: String,
+        requestedClassId: String = "0"
+    ) -> CloudBookcasePage {
+        guard let doc = try? XMLDocument(xmlString: html, options: [.documentTidyHTML]) else {
+            return CloudBookcasePage(groups: [], items: [], capacityTip: "", activeClassId: requestedClassId)
+        }
+
+        var groups: [CloudBookcaseGroup] = []
+        var activeGroupId = requestedClassId
+        if let options = try? doc.nodes(forXPath: "//select[@name='classlist']/option") as? [XMLElement] {
+            for opt in options {
+                let id = opt.attribute(forName: "value")?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let title = (opt.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !id.isEmpty || !title.isEmpty {
+                    groups.append(CloudBookcaseGroup(id: id.isEmpty ? "0" : id, title: title.isEmpty ? "默认书架" : title))
+                    if opt.attribute(forName: "selected") != nil && !id.isEmpty {
+                        activeGroupId = id
+                    }
+                }
+            }
+        }
+
+        var items: [CloudBookcaseItem] = []
+        if let rows = try? doc.nodes(forXPath: "//table[contains(@class,'grid')]//tr") as? [XMLElement] {
+            for row in rows {
+                guard let checkbox = (try? row.nodes(forXPath: ".//input[@type='checkbox']").first) as? XMLElement else {
+                    continue
+                }
+                let bidFromCheckbox = checkbox.attribute(forName: "value")?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard let cells = try? row.nodes(forXPath: "./td") as? [XMLElement], cells.count >= 4 else {
+                    continue
+                }
+
+                // Cell 1: Book link (readbookcase.php?aid=...&bid=... or /book/xxx.htm)
+                let bookLink = (try? cells[1].nodes(forXPath: ".//a[@href]").first) as? XMLElement
+                let bookHref = bookLink?.attribute(forName: "href")?.stringValue ?? ""
+                let bookTitle = (bookLink?.stringValue ?? cells[1].stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let aid = extractQueryParam("aid", from: bookHref).isEmpty
+                    ? extractBookId(from: bookHref)
+                    : extractQueryParam("aid", from: bookHref)
+                let bid = !bidFromCheckbox.isEmpty ? bidFromCheckbox : extractQueryParam("bid", from: bookHref)
+
+                // Cell 2: Author
+                let author = (cells[2].stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+                // Cell 3: Last read chapter link (reader.php?aid=...&cid=...)
+                let chapLink = (try? cells[3].nodes(forXPath: ".//a[@href]").first) as? XMLElement
+                let chapHref = chapLink?.attribute(forName: "href")?.stringValue ?? ""
+                let cid = extractQueryParam("cid", from: chapHref)
+                let chapTitle = (chapLink?.stringValue ?? cells[3].stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if !aid.isEmpty && !bookTitle.isEmpty {
+                    let groupDir = (Int(aid) ?? 0) / 1000
+                    let cover = "https://img.wenku8.com/image/\(groupDir)/\(aid)/\(aid)s.jpg"
+                    items.append(CloudBookcaseItem(
+                        aid: aid,
+                        bid: bid.isEmpty ? aid : bid,
+                        groupId: activeGroupId,
+                        title: bookTitle,
+                        author: author,
+                        lastReadChapterId: cid,
+                        lastReadChapterTitle: chapTitle,
+                        coverURL: cover
+                    ))
+                }
+            }
+        }
+
+        var capacityTip = ""
+        if let range = html.range(of: #"您的书架可收藏\s*\d+\s*本[，,]?\s*已收藏\s*\d+\s*本"#, options: .regularExpression) {
+            capacityTip = String(html[range])
+        }
+
+        return CloudBookcasePage(
+            groups: groups,
+            items: items,
+            capacityTip: capacityTip,
+            activeClassId: activeGroupId
+        )
+    }
+
+    private static func extractQueryParam(_ name: String, from rawURL: String) -> String {
+        guard let comps = URLComponents(string: rawURL) ?? URLComponents(string: "https://www.wenku8.cc" + (rawURL.hasPrefix("/") ? rawURL : "/" + rawURL)) else {
+            return ""
+        }
+        return comps.queryItems?.first(where: { $0.name == name })?.value ?? ""
+    }
+
+    public static func parseAuthorBooksPage(html: String) -> [AuthorBookItem] {
+        guard let doc = try? XMLDocument(xmlString: html, options: [.documentTidyHTML]) else {
+            return []
+        }
+        let primaryBlocks = (try? doc.nodes(forXPath: "//div[@id='content']//div[contains(@style,'width:373px')]") as? [XMLElement]) ?? []
+        let blocks: [XMLElement]
+        if !primaryBlocks.isEmpty {
+            blocks = primaryBlocks
+        } else {
+            blocks = (try? doc.nodes(forXPath: "//table[contains(@class,'grid')]//td/div[.//a[contains(@href,'/book/')]]") as? [XMLElement]) ?? []
+        }
+        guard !blocks.isEmpty else {
             return []
         }
 
@@ -971,7 +1563,9 @@ public actor Wenku8Client {
         for block in blocks {
             let href = (try? block.nodes(forXPath: ".//a[contains(@href,'/book/')]/@href").first?.stringValue) ?? ""
             let bookId = extractBookId(from: href)
-            let title = (try? block.nodes(forXPath: ".//b//a").first?.stringValue)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let title = (try? block.nodes(forXPath: ".//b//a").first?.stringValue)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? (try? block.nodes(forXPath: ".//a[contains(@href,'/book/') and @title]/@title").first?.stringValue)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? ""
             let cover = (try? block.nodes(forXPath: ".//img/@src").first?.stringValue) ?? ""
             let text = block.stringValue ?? ""
             var author = ""
@@ -1070,5 +1664,17 @@ public actor Wenku8Client {
             return (max(1, Int(img.size.width)), max(1, Int(img.size.height)))
         }
         return (600, 850)
+    }
+}
+
+private final class NoRedirectSessionDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 }

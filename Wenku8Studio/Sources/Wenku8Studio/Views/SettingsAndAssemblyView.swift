@@ -52,6 +52,30 @@ struct SettingsAndAssemblyView: View {
                             }
                         }
 
+                        if let profile = vm.userProfile, !profile.username.isEmpty {
+                            HStack(spacing: 12) {
+                                Image(systemName: "person.crop.circle.badge.checkmark")
+                                    .font(.title2)
+                                    .foregroundStyle(.green)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("\(profile.nickname.isEmpty ? profile.username : profile.nickname) (\(profile.level.isEmpty ? "会员" : profile.level))")
+                                        .font(.callout.weight(.semibold))
+                                    Text("积分 \(profile.holdingPoints.isEmpty ? "-" : profile.holdingPoints) · 经验 \(profile.experienceValue.isEmpty ? "-" : profile.experienceValue) · 每日推荐 \(profile.dailyVoteQuota.isEmpty ? "-" : profile.dailyVoteQuota) 次 · 书架上限 \(profile.bookcaseCapacity.isEmpty ? "-" : profile.bookcaseCapacity) 本")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("打开书架") {
+                                    vm.selectedSection = .bookshelf
+                                    vm.syncBookshelfBidirectionally(silent: true)
+                                }
+                                .buttonStyle(.glass)
+                                .controlSize(.small)
+                            }
+                            .padding(10)
+                            .glassEffect(.regular.tint(.green.opacity(0.10)), in: RoundedRectangle(cornerRadius: 10))
+                        }
+
                         GlassEffectContainer(spacing: 10) {
                             HStack(spacing: 10) {
                                 Button {
@@ -73,16 +97,76 @@ struct SettingsAndAssemblyView: View {
                                 .buttonStyle(.glass)
                                 .disabled(vm.isTestingCookie)
 
+                                Button {
+                                    Task { await vm.refreshCookieKeepAlive(silent: false) }
+                                } label: {
+                                    if vm.isRefreshingCookie {
+                                        ProgressView().controlSize(.small)
+                                    } else {
+                                        Label("立即刷新续期", systemImage: "arrow.triangle.2.circlepath")
+                                    }
+                                }
+                                .buttonStyle(.glass)
+                                .disabled(vm.isRefreshingCookie || vm.customCookie.isEmpty)
+
                                 if !vm.customCookie.isEmpty {
                                     Button("清空") {
-                                        vm.customCookie = ""
-                                        vm.cookieVerifyMessage = nil
-                                        vm.cookieVerifyPassed = nil
-                                        Task { await vm.syncClientSettings() }
+                                        vm.clearSavedCookie()
                                     }
                                     .buttonStyle(.glass)
                                 }
                             }
+                        }
+
+                        Divider().padding(.vertical, 2)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Toggle("登录后自动定时保活并动态刷新 Cookie", isOn: $vm.autoRefreshCookieEnabled)
+                                .onChange(of: vm.autoRefreshCookieEnabled) { _, _ in
+                                    vm.rescheduleCookieRefresh()
+                                }
+
+                            if vm.autoRefreshCookieEnabled {
+                                HStack(spacing: 12) {
+                                    Text("动态刷新间隔")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Picker("刷新间隔", selection: $vm.cookieRefreshIntervalMinutes) {
+                                        Text("5 分钟").tag(5)
+                                        Text("10 分钟").tag(10)
+                                        Text("15 分钟").tag(15)
+                                        Text("30 分钟").tag(30)
+                                        Text("60 分钟").tag(60)
+                                    }
+                                    .labelsHidden()
+                                    .pickerStyle(.segmented)
+                                    .frame(maxWidth: 340)
+                                    .onChange(of: vm.cookieRefreshIntervalMinutes) { _, _ in
+                                        vm.rescheduleCookieRefresh()
+                                    }
+                                }
+                            }
+
+                            HStack(spacing: 14) {
+                                if let lastAt = vm.lastCookieRefreshAt {
+                                    Label(
+                                        "上次刷新：\(lastAt.formatted(date: .omitted, time: .shortened))",
+                                        systemImage: "clock.badge.checkmark"
+                                    )
+                                }
+                                if let nextAt = vm.nextCookieRefreshAt, vm.autoRefreshCookieEnabled {
+                                    Label(
+                                        "下次刷新：\(nextAt.formatted(date: .omitted, time: .shortened))",
+                                        systemImage: "timer"
+                                    )
+                                }
+                                if let refreshStatus = vm.lastCookieRefreshStatus, !refreshStatus.isEmpty {
+                                    Text(refreshStatus)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                         }
 
                         Text("手动获取说明：在浏览器打开 www.wenku8.cc 并登录后，按 ⌘⌥I → Application → Cookies → https://www.wenku8.cc，复制含 jieqiUserInfo 和 PHPSESSID 的键值（勿粘贴微软/必应 MUID 等其他站点 Cookie）。")
